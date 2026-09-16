@@ -1,0 +1,9 @@
+# Zephyr / west build output
+build/
+build-*/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

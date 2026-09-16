@@ -1,0 +1,151 @@
+# Builds the capture firmware and publishes it on a v* tag.
+#
+# Building here rather than uploading a local build is the point: the hex in a
+# release and the source at that tag cannot drift. The host refuses a capture
+# whose firmware version disagrees with what it expects, and a hand-assembled
+# release makes that mismatch possible without making it visible.
+#
+# workflow_dispatch builds and uploads the artifacts without publishing, which
+# is how to find out whether the toolchain image has moved before a tag is in
+# the open.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  firmware:
+    name: firmware (nRF54L15)
+    runs-on: ubuntu-latest
+    container: ghcr.io/nrfconnect/sdk-nrf-toolchain:v3.4.0
+    env:
+      NCS_VERSION: v3.4.0
+    steps:
+      # shared/ is a submodule and frame.c is compiled from it. Without this
+      # the checkout is missing that file and the build fails at compile time
+      # rather than silently -- which is the arrangement working.
+      - uses: actions/checkout@v4
+        with:
+          path: sniffer
+          submodules: recursive
+
+      # The checkout is owned by a different uid than the container's user, so
+      # git refuses it as "dubious ownership", and west runs git across every
+      # project in the workspace.
+      - name: Let git read the checkout
+        run: git config --global --add safe.directory '*'
+
+      # Several GB and identical for a given NCS version, so worth caching.
+      - name: Cache the west workspace
+        id: ncs-cache
+        uses: actions/cache@v4
+        with:
+          path: ncs
+          key: ncs-${{ env.NCS_VERSION }}
+
+      - name: Fetch the SDK
+        if: steps.ncs-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p ncs && cd ncs
+          west init -m https://github.com/nrfconnect/sdk-nrf --mr "$NCS_VERSION" .
+          west update --narrow -o=--depth=1
+          west zephyr-export
+
+      - name: Build
+        shell: bash
+        run: |
+          cd ncs
+          # west resolves the board and the modules from the workspace it is
+          # run inside; outside one it reports only "unknown command build".
+          west build --no-sysbuild \
+            -b xiao_nrf54l15/nrf54l15/cpuapp \
+            -d "$GITHUB_WORKSPACE/build" \
+            "$GITHUB_WORKSPACE/sniffer" \
+            --pristine -- -DSN_MODE=2
+          cp "$GITHUB_WORKSPACE/build/zephyr/zephyr.hex" \
+             "$GITHUB_WORKSPACE/nrf54l15.hex"
+
+      # Shipped beside the hex because flashing this board needs it: the image
+      # is written by a board-specific `nrf54l-load` proc defined in this file,
+      # not by openocd's generic flash command. The hex alone is not flashable.
+      - name: Collect the openocd config
+        shell: bash
+        run: |
+          cp ncs/zephyr/boards/seeed/xiao_nrf54l15/support/openocd.cfg \
+             "$GITHUB_WORKSPACE/openocd.cfg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            nrf54l15.hex
+            openocd.cfg
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: [firmware]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Lay out the assets
+        shell: bash
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          mkdir -p release
+          cp "artifacts/firmware/nrf54l15.hex" "release/nrf54l15-$version.hex"
+          cp "artifacts/firmware/openocd.cfg"  "release/openocd.cfg"
+          cd release && sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version="${GITHUB_REF#refs/tags/}"
+          notes="$(cat <<EOF
+          Passive IEEE 802.15.4 capture firmware for the Seeed XIAO nRF54L15.
+          Nothing here transmits.
+
+          ## Flash
+
+          This board has a SAMD11 running CMSIS-DAP, so openocd is the runner;
+          a SEGGER probe is not needed and \`nrfjprog\` will not find it. The
+          \`openocd.cfg\` here is the board's own -- the write goes through a
+          board-specific \`nrf54l-load\` defined in it, so the hex alone is not
+          flashable:
+
+          \`\`\`
+          openocd -f openocd.cfg -c init -c targets -c "reset init" \\
+            -c "nrf54l-load nrf54l15-$version.hex" -c "reset run" -c shutdown
+          \`\`\`
+
+          ## Then read it in Wireshark
+
+          The plugin is in
+          [esp32c6-sniffer](https://github.com/Thenewmanator15/esp32c6-sniffer/releases/latest)
+          and speaks to both boards. Install it from there, restart Wireshark,
+          and the nRF54L15 interface appears on the welcome screen.
+
+          The link runs at 1 Mbaud. The plugin already knows; nothing to
+          configure.
+
+          Checksums are in \`SHA256SUMS\`.
+          EOF
+          )"
+          gh release create "$version" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$version" \
+            --notes "$notes"
