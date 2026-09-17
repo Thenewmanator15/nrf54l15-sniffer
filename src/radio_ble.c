@@ -93,7 +93,18 @@ struct sync_req {
 K_MSGQ_DEFINE(sync_q, sizeof(struct sync_req), 4, 4);
 static void sync_work_fn(struct k_work *work);
 static K_WORK_DEFINE(sync_work, sync_work_fn);
+
+/* Counters for the STATS frame, in sn_ble_stats order. These used to be two
+ * accessors nothing called, so a BLE capture on this board reported the
+ * 802.15.4 counters of a stopped radio -- zero drops, whatever happened. */
+static uint32_t adv_reports;
+static uint32_t forwarded;
+static uint32_t oversized;
 static uint32_t dropped;
+static uint32_t periodic_seen;
+static uint32_t periodic_synced;
+static uint32_t periodic_reports;
+static uint32_t periodic_refused;
 
 /* The forwarding thread. Its own stack rather than the system work queue's:
  * an extended advertising report is up to 300 bytes and is copied here, and
@@ -188,6 +199,8 @@ static void send_alone(uint64_t timestamp_us, uint16_t orig_len, uint8_t flags,
 
 	if (sn_link_send(SN_FRAME_PACKET, out, sizeof(meta) + len) != 0) {
 		dropped++;
+	} else {
+		forwarded++;
 	}
 }
 
@@ -226,6 +239,8 @@ static void ble_flush_locked(void)
 	 * it, and reporting one drop would understate the loss. */
 	if (sn_link_send(SN_FRAME_BLE_BATCH, bbuf, bused) != 0) {
 		dropped += bcount;
+	} else {
+		forwarded += bcount;
 	}
 
 	bcount = 0u;
@@ -241,6 +256,58 @@ static void ble_linger_expired(struct k_work *work)
 	k_mutex_unlock(&block);
 }
 
+/* Counts what an event was, for the STATS frame.
+ *
+ * Read straight off the event rather than the H4-shimmed copy note_periodic
+ * works on, so every offset here is one lower than there: evt[0] is the event
+ * code and evt[2] the LE subevent. */
+static void note_counts(const uint8_t *evt, uint16_t len)
+{
+	if (len < 3u || evt[0] != BT_HCI_EVT_LE_META_EVENT) {
+		return;
+	}
+
+	switch (evt[2]) {
+	case BT_HCI_EVT_LE_ADVERTISING_REPORT:
+	case BT_HCI_EVT_LE_EXT_ADVERTISING_REPORT:
+		adv_reports++;
+		break;
+	case BT_HCI_EVT_LE_PER_ADVERTISING_REPORT:
+		periodic_reports++;
+		break;
+	case BT_HCI_EVT_LE_PER_ADV_SYNC_ESTABLISHED:
+		/* Its first parameter is a status, so this one event is both
+		 * the success and the failure report -- and the failure is the
+		 * only place a refusal can be seen here, because send_command
+		 * waits for nothing and returns whether the command was
+		 * handed over, not whether it was accepted.
+		 *
+		 * Freeing the slot is the part that matters more than the
+		 * counter: sync_count went up when the command went out, and
+		 * with one sync to give, a failure that left it up would stop
+		 * this board following any train for the rest of the
+		 * capture. */
+		if (len >= 4u && evt[3] == BT_HCI_ERR_SUCCESS) {
+			periodic_synced++;
+		} else {
+			periodic_refused++;
+			if (sync_count > 0u) {
+				sync_count--;
+			}
+		}
+		break;
+	case BT_HCI_EVT_LE_PER_ADV_SYNC_LOST:
+		/* The train went away. Same reasoning: hold the slot and
+		 * nothing replaces it. */
+		if (sync_count > 0u) {
+			sync_count--;
+		}
+		break;
+	default:
+		break;
+	}
+}
+
 static void forward(struct net_buf *buf, uint8_t h4_type)
 {
 	/* One more byte than the event, for the H4 type put back on the
@@ -252,9 +319,18 @@ static void forward(struct net_buf *buf, uint8_t h4_type)
 	if (take > SN_BLE_MAX_PACKET) {
 		take = SN_BLE_MAX_PACKET;
 		flags |= SN_BLE_FLAG_TRUNCATED;
+		oversized++;
 	}
 
 	const uint64_t ts = now_us();
+
+	/* Unconditional, unlike the periodic peek below: how many of these
+	 * were advertising reports is the difference between an empty room
+	 * and a deaf radio, and both are worth knowing when periodic
+	 * following is off. */
+	if (h4_type == H4_EVENT) {
+		note_counts(buf->data, buf->len);
+	}
 
 	/* Before batching, because this reads the event rather than the copy,
 	 * and because a train noticed late is a train not followed. */
@@ -600,6 +676,11 @@ static void note_periodic(const uint8_t *hci, uint16_t len)
 		return;
 	}
 
+	/* Counted per announcement rather than per advertiser: the same train
+	 * is announced repeatedly, and the figure is here to show the
+	 * detection path ran at all. */
+	periodic_seen++;
+
 	struct sync_req req = {
 		.sid = hci[16],
 		.addr_type = hci[7],
@@ -660,12 +741,19 @@ int sn_radio_ble_stop(void)
 			    disable, sizeof(disable));
 }
 
-uint32_t sn_radio_ble_captured(void)
+void sn_radio_ble_get_stats(struct sn_ble_stats *out)
 {
-	return captured;
-}
-
-uint32_t sn_radio_ble_dropped(void)
-{
-	return dropped;
+	*out = (struct sn_ble_stats){
+		.hci_packets = captured,
+		.adv_reports = adv_reports,
+		.forwarded = forwarded,
+		.oversized = oversized,
+		.queue_full = 0u,
+		.link_rejected = dropped,
+		.command_timeouts = 0u,
+		.periodic_seen = periodic_seen,
+		.periodic_synced = periodic_synced,
+		.periodic_reports = periodic_reports,
+		.periodic_refused = periodic_refused,
+	};
 }

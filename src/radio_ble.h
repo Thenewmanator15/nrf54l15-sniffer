@@ -87,6 +87,30 @@ void sn_radio_ble_set_filter(const uint8_t *payload, size_t len);
  * should not pay for it. */
 void sn_radio_ble_set_periodic(bool enable);
 
-/* Counters for the STATS frame. */
-uint32_t sn_radio_ble_captured(void);
-uint32_t sn_radio_ble_dropped(void);
+/* Counters for the STATS frame.
+ *
+ * Field for field, in order, the same as sn_ble_stats_t in the ESP32-C6
+ * firmware, because the host reads one block by position for both boards and
+ * decides from the payload's length how many counters arrived. A field that
+ * moves here decodes as the one after it there.
+ *
+ * Three are always zero on this board, and deliberately: there is no
+ * intermediate receive queue to overflow, and send_command does not wait for
+ * a controller answer, so neither a queue-full nor a command timeout is a
+ * measurement this firmware can make. Reporting anything but zero for them
+ * would invent one. */
+struct sn_ble_stats {
+	uint32_t hci_packets;      /* events and ISO packets handed over */
+	uint32_t adv_reports;      /* of those, LE advertising reports */
+	uint32_t forwarded;        /* packets the link accepted */
+	uint32_t oversized;        /* truncated to SN_BLE_MAX_PACKET */
+	uint32_t queue_full;       /* always 0: no such queue here */
+	uint32_t link_rejected;    /* packets the outbound ring refused */
+	uint32_t command_timeouts; /* always 0: commands are not awaited */
+	uint32_t periodic_seen;    /* advertisers announcing a periodic train */
+	uint32_t periodic_synced;  /* syncs the controller established */
+	uint32_t periodic_reports; /* periodic advertising reports received */
+	uint32_t periodic_refused; /* syncs the controller would not establish */
+};
+
+void sn_radio_ble_get_stats(struct sn_ble_stats *out);

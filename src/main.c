@@ -84,18 +84,30 @@ static void conformance_burst(void)
 #endif
 
 #if SN_MODE == SN_MODE_CAPTURE
-/* Published once a second, in the short form of the stats payload the host
- * already decodes: five link counters then three for the radio, as
- * sn_link_stats_t and sn_154_stats_t are laid out in the ESP-IDF firmware.
- * The host reads it as "<8I" and zero-fills the Wi-Fi counters it knows this
- * board does not have.
+/* Published once a second, laid out exactly as the ESP-IDF firmware lays it
+ * out: five link counters, three for the 802.15.4 radio, twelve for Wi-Fi and
+ * eleven for BLE. The host reads all four blocks by position and decides from
+ * the payload's length how many counters a given firmware sent.
  *
- * frames_dropped_ringfull is now a real measurement: the outbound ring can
- * fill if the host stops draining, and a frame refused at that point is loss
- * the operator should be told about. The rest stay zero deliberately -- this
- * link does not detect short writes or transmit stalls, so reporting anything
- * but zero for those would invent a measurement. */
-struct __attribute__((packed)) sn_stats_short {
+ * The Wi-Fi block is twelve zeros and stays: this board has no Wi-Fi radio,
+ * but the BLE block sits behind that space and every counter in it would be
+ * read as a Wi-Fi one if it were closed up.
+ *
+ * Sending BLE is new. The counters existed and reached nobody -- two
+ * accessors that nothing called -- so a BLE capture here reported
+ * sn_radio154_captured(), which is a stopped radio's zero, and the file's
+ * statistics block said no loss whatever the link had refused.
+ *
+ * frames_dropped_ringfull is a real measurement: the outbound ring can fill
+ * if the host stops draining, and a frame refused at that point is loss the
+ * operator should be told about. short_writes and tx_stalls stay zero
+ * deliberately -- this link does not detect either, so reporting anything but
+ * zero would invent a measurement.
+ *
+ * Not packed, and the C6's copy is not either: every member is a uint32_t, so
+ * the layout is already gap-free at four-byte alignment, and packing it would
+ * only make taking the address of the BLE block unsafe. */
+struct sn_stats_full {
 	uint32_t frames_sent;
 	uint32_t frames_dropped_ringfull;
 	uint32_t short_writes;
@@ -104,6 +116,8 @@ struct __attribute__((packed)) sn_stats_short {
 	uint32_t frames_captured;
 	uint32_t isr_queue_full;
 	uint32_t link_rejected;
+	uint32_t wifi[12];
+	struct sn_ble_stats ble;
 };
 
 /* The outbound ring's occupancy, unpacked by the host as "<III". Occupancy
@@ -126,7 +140,7 @@ static void stats_tick(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
-	const struct sn_stats_short stats = {
+	struct sn_stats_full stats = {
 		.frames_sent = sn_link_frames_sent(),
 		.frames_dropped_ringfull = sn_link_frames_dropped(),
 		.short_writes = 0u,
@@ -135,7 +149,13 @@ static void stats_tick(struct k_work *work)
 		.frames_captured = sn_radio154_captured(),
 		.isr_queue_full = 0u,
 		.link_rejected = sn_radio154_dropped(),
+		.wifi = {0},
 	};
+
+	/* Both radios' counters go in every frame, whichever is running, for
+	 * the reason the C6 firmware gives: sending only the active one
+	 * leaves the host unable to tell a zero counter from an absent one. */
+	sn_radio_ble_get_stats(&stats.ble);
 
 	sn_link_send(SN_FRAME_STATS, (const uint8_t *)&stats, sizeof(stats));
 
