@@ -57,11 +57,19 @@ to leave, which is what exposed it. Transfers are therefore capped at 64 bytes
 with a deliberate 20 us gap, costing about 3% of line rate. That has held, but
 it is a workaround for a bridge that is not ours, not a guarantee.
 
-**Every packet costs 22 bytes of overhead**: a 10-byte frame header and 12
-bytes of metadata, so a 5-byte acknowledgement travels as 27. `PACKET_BATCH`
-exists in the wire format to amortise exactly that, and this firmware does not
-yet emit it. Ordinary traffic has room to spare against 94 kB/s; a channel
-saturated with minimum-size frames is the case that does not.
+**Per-packet overhead is 22 bytes, and batching only helps when traffic is
+dense.** A packet sent on its own costs a 10-byte frame header and 12 bytes of
+metadata, so a 5-byte acknowledgement travels as 27. Packets that arrive within
+20 ms of each other are combined into one `PACKET_BATCH`, which shares a single
+header and delta-codes the timestamps: a full batch of 32 costs about 5.6 bytes
+per packet instead of 22.
+
+The catch is that a quiet channel produces no batches worth the name. On this
+bench most packets arrive alone and are sent alone -- a batch of one would be
+*larger* than a plain `PACKET`, so the firmware sends a `PACKET` instead. The
+saving is therefore real on a busy channel and zero on an idle one, which is
+the opposite of when a sniffer is under pressure but the same direction as
+where the bytes actually are.
 
 **Frames that fail their checksum never arrive.** The driver validates and
 strips the FCS before this firmware sees anything, so a capture cannot show

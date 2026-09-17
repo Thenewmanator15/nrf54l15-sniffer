@@ -23,6 +23,7 @@
 
 #include <nrf_802154.h>
 
+#include "batch.h"
 #include "frame.h"
 #include "link.h"
 
@@ -32,7 +33,6 @@ static struct ieee802154_radio_api *api;
 
 static uint8_t current_channel = 11;
 static uint32_t captured;
-static uint32_t dropped;
 
 /* The largest PSDU an 802.15.4 frame can carry. */
 #define SN_154_MAX_PSDU 127
@@ -97,7 +97,9 @@ uint32_t sn_radio154_captured(void)
 
 uint32_t sn_radio154_dropped(void)
 {
-	return dropped;
+	/* Loss is decided when a batch is sent, not when a packet is taken,
+	 * so the count lives with the batcher. */
+	return sn_batch_dropped();
 }
 
 /* Every received frame arrives here. */
@@ -120,31 +122,28 @@ int net_recv_data(struct net_if *iface, struct net_pkt *pkt)
 	 * net_pkt_timestamp_ns() on this path. */
 	struct net_ptp_time *pkt_time = net_pkt_timestamp(pkt);
 
-	struct sn_154_meta meta = {
-		.channel = current_channel,
-		.lqi = net_pkt_ieee802154_lqi(pkt),
-		.rssi_dbm = (int8_t)net_pkt_ieee802154_rssi_dbm(pkt),
-		/* SN_154_FLAG_HAS_FCS stays clear: the driver strips the
-		 * checksum before we see the frame, exactly as the C6's does,
-		 * so claiming an FCS is present would be a lie the host would
-		 * believe. */
-		.flags = 0u,
-		.timestamp_us = (uint64_t)pkt_time->second * 1000000ULL +
-				(uint64_t)pkt_time->nanosecond / 1000ULL,
-	};
-
-	static uint8_t payload[sizeof(struct sn_154_meta) + SN_154_MAX_PSDU];
+	const uint64_t timestamp_us = (uint64_t)pkt_time->second * 1000000ULL +
+				      (uint64_t)pkt_time->nanosecond / 1000ULL;
 
 	if (length > SN_154_MAX_PSDU) {
 		length = SN_154_MAX_PSDU;
 	}
-	memcpy(payload, &meta, sizeof(meta));
-	memcpy(payload + sizeof(meta), psdu, length);
 
+	/* Into a batch rather than a frame of its own. The metadata the host
+	 * reads is identical either way -- it expands each entry into exactly
+	 * the PACKET payload this used to build -- but the per-packet cost
+	 * falls from 22 bytes to about 5.6, which is what this board's 94 kB/s
+	 * link needs on a channel carrying small frames back to back.
+	 *
+	 * There is no flags field in a batch entry. SN_154_FLAG_HAS_FCS was
+	 * the only flag and it was always clear here, because the driver
+	 * strips the checksum before this code sees a frame. Carrying a byte
+	 * that is always zero would have cost more than the flag was worth. */
 	captured++;
-	if (sn_link_send(SN_FRAME_PACKET, payload, sizeof(meta) + length) != 0) {
-		dropped++;
-	}
+	sn_batch_add(current_channel, timestamp_us,
+		     net_pkt_ieee802154_lqi(pkt),
+		     (int8_t)net_pkt_ieee802154_rssi_dbm(pkt),
+		     psdu, length);
 
 	net_pkt_unref(pkt);
 	return 0;

@@ -22,6 +22,7 @@ target_sources(app PRIVATE
     src/link.c
     src/radio154.c
     src/control.c
+    src/batch.c
     src/log_backend_sn.c
     shared/frame.c
 )
