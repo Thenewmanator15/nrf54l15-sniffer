@@ -105,6 +105,19 @@ struct __attribute__((packed)) sn_stats_short {
 	uint32_t link_rejected;
 };
 
+/* The outbound ring's occupancy, unpacked by the host as "<III". Occupancy
+ * only -- frames refused because the ring was full travel in STATS above, and
+ * counting them here as well would double them in the pcapng statistics.
+ *
+ * queued_bytes is how far behind real time the host is; divide by the drain
+ * rate for seconds. high_water is the worst it reached this session, which is
+ * the number that survives a burst nobody was watching for. */
+struct __attribute__((packed)) sn_link_status {
+	uint32_t queued_bytes;
+	uint32_t high_water;
+	uint32_t capacity;
+};
+
 static void stats_tick(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(stats_work, stats_tick);
 
@@ -124,6 +137,16 @@ static void stats_tick(struct k_work *work)
 	};
 
 	sn_link_send(SN_FRAME_STATS, (const uint8_t *)&stats, sizeof(stats));
+
+	/* Sent after STATS and measured before itself: the figure describes
+	 * what was waiting, not what this frame added. */
+	const struct sn_link_status link = {
+		.queued_bytes = sn_link_queued(),
+		.high_water = sn_link_high_water(),
+		.capacity = sn_link_capacity(),
+	};
+
+	sn_link_send(SN_FRAME_LINK, (const uint8_t *)&link, sizeof(link));
 	k_work_schedule(&stats_work, K_SECONDS(1));
 }
 #endif

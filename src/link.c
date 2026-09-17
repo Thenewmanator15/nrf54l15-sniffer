@@ -34,6 +34,7 @@ static uint16_t seq;
 static uint32_t frames_sent;
 static uint32_t bytes_sent;
 static uint32_t frames_dropped;
+static uint32_t queued_high_water;
 
 /* Outbound bytes waiting for DMA. Sized for roughly a tenth of a second at
  * 1 Mbaud, which covers a burst without letting a stalled host buffer
@@ -263,6 +264,15 @@ int sn_link_send(sn_frame_type_t type, const uint8_t *payload, size_t len)
 	frames_sent++;
 	bytes_sent += (uint32_t)n;
 
+	/* Peak occupancy is measured here, the moment after a frame goes in,
+	 * because that is when the ring is fullest. Sampling it from the stats
+	 * tick instead would miss every burst that drained between ticks --
+	 * which is exactly the burst worth knowing about. */
+	const uint32_t queued = ring_buf_size_get(&tx_ring);
+	if (queued > queued_high_water) {
+		queued_high_water = queued;
+	}
+
 	k_mutex_unlock(&encode_lock);
 	k_sem_give(&tx_ready);
 	return 0;
@@ -281,4 +291,23 @@ uint32_t sn_link_bytes_sent(void)
 uint32_t sn_link_frames_dropped(void)
 {
 	return frames_dropped;
+}
+
+/* Read while the TX thread is draining, so this is a gauge rather than a
+ * fixed quantity -- which is what a queue depth is. It is reported to tell an
+ * operator how far behind real time the host has fallen; divide by the drain
+ * rate for seconds. */
+uint32_t sn_link_queued(void)
+{
+	return ring_buf_size_get(&tx_ring);
+}
+
+uint32_t sn_link_high_water(void)
+{
+	return queued_high_water;
+}
+
+uint32_t sn_link_capacity(void)
+{
+	return TX_RING_SIZE;
 }

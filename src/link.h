@@ -30,3 +30,15 @@ uint32_t sn_link_bytes_sent(void);
  * the host rather than hidden: a sniffer that quietly discards is worse than
  * one that says how much it discarded. */
 uint32_t sn_link_frames_dropped(void);
+
+/* The outbound ring's occupancy, for the LINK frame. Occupancy ONLY: frames
+ * refused because it was full are counted above and already reach the host in
+ * STATS, and carrying them here too would double them in the pcapng
+ * interface-statistics blocks.
+ *
+ * Worth having because drops answer "did I lose anything?" only after the
+ * fact, while queue depth answers "am I about to?" -- a ring climbing towards
+ * capacity is the warning that precedes the first drop. */
+uint32_t sn_link_queued(void);
+uint32_t sn_link_high_water(void);
+uint32_t sn_link_capacity(void);

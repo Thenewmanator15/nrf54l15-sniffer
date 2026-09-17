@@ -87,9 +87,12 @@ return `SN_STATUS_UNKNOWN_COMMAND`. In particular there is no spectrum survey,
 so "which channel is busy?" has to be answered with a capture.
 
 **Drop accounting is partial.** Frames refused because the outbound ring was
-full are counted and reported. Short writes and transmit stalls are always
-reported as zero, because this link cannot detect them -- reporting anything
-else would invent a measurement.
+full are counted and reported, as is the ring's depth and the high-water mark
+it reached -- drops say what was lost after the fact, depth says whether loss
+is coming. Short writes and transmit stalls are always reported as zero,
+because this link cannot detect them: reporting anything else would invent a
+measurement, and a zero meaning "none" is indistinguishable from a zero meaning
+"cannot tell".
 
 **Timestamp accuracy is uncharacterised.** Timestamps come from the driver's
 own packet timestamp at microsecond resolution. The ~0.5 us figure measured on
