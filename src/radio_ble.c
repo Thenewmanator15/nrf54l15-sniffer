@@ -22,6 +22,10 @@
  * net_buf rather than a byte inside it, so it is put back on the front here --
  * the host's dissector expects H4 framing, starting with this byte. */
 #define H4_EVENT 0x04u
+/* Isochronous data is simply another H4 packet type, which is the reason this
+ * needed no new frame type: the BLE path already carries whatever H4 packet
+ * the controller hands over, and Wireshark's own HCI dissector reads ISO. */
+#define H4_ISO   0x05u
 
 /* Scan parameters, assembled exactly as the ESP32-C6 firmware assembles them
  * so the two controllers are told the same thing. */
@@ -47,6 +51,7 @@
 
 static int apply_filter(void);
 static void note_periodic(const uint8_t *hci, uint16_t len);
+static void note_biginfo(const uint8_t *hci, uint16_t len);
 
 static K_FIFO_DEFINE(hci_rx);
 static bool running;
@@ -64,6 +69,11 @@ static uint8_t filter_count;
 #define MAX_SYNCS 2
 static bool periodic_enabled;
 static uint8_t sync_count;
+
+/* One broadcast group at a time. A second would need its own BIG handle and
+ * its own set of stream indices, and nothing here has asked for two. */
+#define MAX_BIS 4
+static bool big_synced;
 
 struct sync_req {
 	uint8_t sid;
@@ -227,7 +237,7 @@ static void ble_linger_expired(struct k_work *work)
 	k_mutex_unlock(&block);
 }
 
-static void forward(struct net_buf *buf)
+static void forward(struct net_buf *buf, uint8_t h4_type)
 {
 	/* One more byte than the event, for the H4 type put back on the
 	 * front. The host counts orig_len the same way. */
@@ -256,6 +266,7 @@ static void forward(struct net_buf *buf)
 		peek[0] = H4_EVENT;
 		memcpy(peek + 1, buf->data, n - 1u);
 		note_periodic(peek, n);
+		note_biginfo(peek, n);
 	}
 
 	k_mutex_lock(&block, K_FOREVER);
@@ -286,7 +297,7 @@ static void forward(struct net_buf *buf)
 	at[6] = (uint8_t)(take >> 8);
 	/* The H4 type byte is not in the buffer in raw mode, so it goes back
 	 * on the front here -- the host's dissector expects H4 framing. */
-	at[BLE_ENTRY_LEN] = H4_EVENT;
+	at[BLE_ENTRY_LEN] = h4_type;
 	memcpy(at + BLE_ENTRY_LEN + 1, buf->data, take - 1u);
 
 	bused += BLE_ENTRY_LEN + take;
@@ -331,11 +342,16 @@ static void fwd_loop(void *a, void *b, void *c)
 		 *
 		 * A capture should contain what the radio heard. Nothing else
 		 * is lost: an advertisement arrives as an LE Meta event. */
-		if (running && bt_buf_get_type(buf) == BT_BUF_EVT &&
-		    buf->len > 0u &&
-		    buf->data[0] != BT_HCI_EVT_CMD_COMPLETE &&
-		    buf->data[0] != BT_HCI_EVT_CMD_STATUS) {
-			forward(buf);
+		const enum bt_buf_type kind = bt_buf_get_type(buf);
+
+		if (running && kind == BT_BUF_ISO_IN) {
+			/* A broadcast isochronous stream: the audio itself,
+			 * rather than the advertisement announcing it. */
+			forward(buf, H4_ISO);
+		} else if (running && kind == BT_BUF_EVT && buf->len > 0u &&
+			   buf->data[0] != BT_HCI_EVT_CMD_COMPLETE &&
+			   buf->data[0] != BT_HCI_EVT_CMD_STATUS) {
+			forward(buf, H4_EVENT);
 		}
 
 		net_buf_unref(buf);
@@ -467,6 +483,7 @@ int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys)
 	 * syncs it held, so the count has to follow it down or no new train
 	 * would ever be followed. */
 	sync_count = 0u;
+	big_synced = false;
 	k_msgq_purge(&sync_q);
 
 	/* Set last: everything above is configuration, and forwarding it
@@ -509,6 +526,60 @@ static void sync_work_fn(struct k_work *work)
 		/* A refusal is ordinary rather than an error: the controller
 		 * rejects a duplicate sync to a train it already follows, and
 		 * every repeat of that advertisement queues another request. */
+	}
+}
+
+/* Notices the BIGInfo that a synced periodic train carries, and asks the
+ * controller to join the broadcast it describes.
+ *
+ * BIGInfo is what turns "there is an Auracast broadcast here" into being able
+ * to receive it: the periodic train announces the group, and this is the
+ * announcement. Everything needed is in the report -- the sync handle it
+ * arrived on, and how many streams the group has -- so no state has to be
+ * carried from the sync that preceded it. */
+static void note_biginfo(const uint8_t *hci, uint16_t len)
+{
+	/* H4, event code, length, subevent, then sync_handle and num_bis. */
+	if (len < 8u || hci[1] != 0x3Eu ||
+	    hci[3] != BT_HCI_EVT_LE_BIGINFO_ADV_REPORT) {
+		return;
+	}
+	if (big_synced) {
+		return;
+	}
+
+	const uint16_t sync_handle = hci[4] | ((uint16_t)hci[5] << 8);
+	const uint8_t num_bis = hci[6];
+
+	if (num_bis == 0u || num_bis > MAX_BIS) {
+		return;
+	}
+
+	/* BIG_Handle, Sync_Handle, Encryption, Broadcast_Code, MSE,
+	 * BIG_Sync_Timeout, Num_BIS, then one index per stream.
+	 *
+	 * Encryption stays zero with an empty broadcast code: an encrypted
+	 * broadcast needs a key nobody has given us, and asking to join one
+	 * without it fails rather than producing anything. MSE 0 lets the
+	 * controller choose; timeout is 2 seconds in 10 ms units. */
+	uint8_t params[25 + MAX_BIS] = {0};
+	uint8_t n = 0;
+
+	params[n++] = 0u;                       /* BIG handle */
+	params[n++] = (uint8_t)(sync_handle & 0xFFu);
+	params[n++] = (uint8_t)(sync_handle >> 8);
+	params[n++] = 0u;                       /* not encrypted */
+	n += 16u;                               /* broadcast code, all zero */
+	params[n++] = 0u;                       /* MSE: controller's choice */
+	params[n++] = 0xC8u;                    /* timeout 2 s, low byte */
+	params[n++] = 0x00u;
+	params[n++] = num_bis;
+	for (uint8_t i = 0; i < num_bis; i++) {
+		params[n++] = i + 1u;           /* BIS indices are 1-based */
+	}
+
+	if (send_command(BT_HCI_OP_LE_BIG_CREATE_SYNC, params, n) == 0) {
+		big_synced = true;
 	}
 }
 
