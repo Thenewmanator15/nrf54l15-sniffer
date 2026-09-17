@@ -37,15 +37,24 @@
  * on having a valid one before it will start. The top two bits are set, which
  * is what makes it a static random address rather than a resolvable one. */
 #define OWN_ADDR_RANDOM   0x01u
-#define FILTER_ACCEPT_ALL 0x00u
+#define FILTER_ACCEPT_ALL  0x00u
+#define FILTER_ACCEPT_LIST 0x01u
 #define SCAN_TYPE_PASSIVE 0x00u   /* never transmit; the whole point */
 
 /* HCI uses 0.625 ms units for scan interval and window. */
 #define UNITS_PER_MS(ms) ((uint16_t)(((uint32_t)(ms) * 1000u) / 625u))
 
+static int apply_filter(void);
+
 static K_FIFO_DEFINE(hci_rx);
 static bool running;
 static uint32_t captured;
+
+/* Eight is what the host's dialog allows and what the ESP32-C6 stores. */
+#define MAX_FILTER 8
+#define FILTER_ENTRY 7   /* address type, then six bytes of address */
+static uint8_t filter[MAX_FILTER][FILTER_ENTRY];
+static uint8_t filter_count;
 static uint32_t dropped;
 
 /* The forwarding thread. Its own stack rather than the system work queue's:
@@ -369,6 +378,12 @@ int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys)
 	if (err != 0) {
 		return err;
 	}
+	/* After the reset, which clears the controller's list, and before the
+	 * scan parameters, which name the policy referring to it. */
+	err = apply_filter();
+	if (err != 0) {
+		return err;
+	}
 
 	const uint16_t interval = UNITS_PER_MS(interval_ms);
 	const uint16_t window = UNITS_PER_MS(window_ms);
@@ -377,7 +392,10 @@ int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys)
 	uint8_t n = 0;
 
 	params[n++] = OWN_ADDR_RANDOM;
-	params[n++] = FILTER_ACCEPT_ALL;
+	/* Set from whether any addresses were given, so a filter that was
+	 * asked for and silently not applied cannot happen. */
+	params[n++] = filter_count > 0u ? FILTER_ACCEPT_LIST
+				        : FILTER_ACCEPT_ALL;
 	params[n++] = phys;
 	for (uint8_t bit = 0; bit < 8; bit++) {
 		if ((phys & (1u << bit)) == 0u) {
@@ -408,6 +426,37 @@ int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys)
 	/* Set last: everything above is configuration, and forwarding it
 	 * would put our own command completes in the capture. */
 	running = true;
+	return 0;
+}
+
+void sn_radio_ble_set_filter(const uint8_t *payload, size_t len)
+{
+	filter_count = 0u;
+	while ((size_t)(filter_count + 1) * FILTER_ENTRY <= len &&
+	       filter_count < MAX_FILTER) {
+		memcpy(filter[filter_count],
+		       payload + (size_t)filter_count * FILTER_ENTRY,
+		       FILTER_ENTRY);
+		filter_count++;
+	}
+}
+
+/* Loads the accept list into the controller. Rebuilt on every scan start
+ * because the reset above clears it. */
+static int apply_filter(void)
+{
+	int err = send_command(BT_HCI_OP_LE_CLEAR_FAL, NULL, 0);
+
+	if (err != 0) {
+		return err;
+	}
+	for (uint8_t i = 0; i < filter_count; i++) {
+		err = send_command(BT_HCI_OP_LE_ADD_DEV_TO_FAL,
+				   filter[i], FILTER_ENTRY);
+		if (err != 0) {
+			return err;
+		}
+	}
 	return 0;
 }
 

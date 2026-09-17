@@ -54,16 +54,16 @@ static uint8_t scratch[SN_HEADER_LEN + SN_MAX_PAYLOAD];
 #define RX_RING_SIZE 512
 RING_BUF_DECLARE(rx_ring, RX_RING_SIZE);
 
-static sn_command_handler_t command_handler;
+static sn_frame_handler_t frame_handler;
 
 /* Reassembly buffer for the reader thread. A control frame is 15 bytes; the
  * headroom is for anything the host adds later. */
 static uint8_t rx_buf[256];
 static size_t rx_len;
 
-void sn_link_set_command_handler(sn_command_handler_t handler)
+void sn_link_set_frame_handler(sn_frame_handler_t handler)
 {
-	command_handler = handler;
+	frame_handler = handler;
 }
 
 static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
@@ -185,8 +185,8 @@ static void drain(void)
 		if (rx_len - at < SN_HEADER_LEN + (size_t)len) {
 			break;      /* the rest is still in flight */
 		}
-		if (p[2] == (uint8_t)SN_FRAME_CONTROL_CMD && command_handler != NULL) {
-			command_handler(p + SN_HEADER_LEN, len);
+		if (frame_handler != NULL) {
+			frame_handler(p[2], p + SN_HEADER_LEN, len);
 		}
 		at += SN_HEADER_LEN + len;
 	}

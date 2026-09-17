@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Bluetooth LE advertisement capture on the nRF54L15.
@@ -57,6 +58,20 @@ int sn_radio_ble_init(void);
 int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys);
 
 int sn_radio_ble_stop(void);
+
+/* The controller's accept list: N entries of (address type, 6-byte address,
+ * least significant byte first) exactly as the host frames them. An empty
+ * payload clears it and scans everything again.
+ *
+ * Filtering in the CONTROLLER rather than here is the point: a rejected
+ * advertisement is never reported and never crosses a 94 kB/s link. One
+ * nearby device advertising at 21 a second was half of everything a survey
+ * heard, so this is the difference between watching a device and watching a
+ * room.
+ *
+ * Stored rather than applied: the list is loaded when a scan starts, because
+ * the controller is reset at that point and forgets it. */
+void sn_radio_ble_set_filter(const uint8_t *payload, size_t len);
 
 /* Counters for the STATS frame. */
 uint32_t sn_radio_ble_captured(void);

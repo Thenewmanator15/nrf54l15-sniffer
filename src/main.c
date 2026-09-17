@@ -175,7 +175,7 @@ int main(void)
 	if (sn_radio_ble_init() != 0) {
 		LOG_ERR("Bluetooth controller would not start; 802.15.4 only");
 	}
-	sn_link_set_command_handler(sn_control_handle);
+	sn_link_set_frame_handler(sn_control_handle);
 
 	/* Travels as a LOG frame, not as bytes on the UART. If this ever
 	 * appears as raw text in a capture, the backend is not installed and

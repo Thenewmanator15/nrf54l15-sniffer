@@ -67,8 +67,19 @@ static void reply(uint8_t command, uint8_t status, uint32_t value)
 	sn_link_send(SN_FRAME_CONTROL_REPLY, out, sizeof(out));
 }
 
-void sn_control_handle(const uint8_t *payload, size_t len)
+void sn_control_handle(uint8_t type, const uint8_t *payload, size_t len)
 {
+	/* BLE_FILTER is a frame rather than a command: an accept list does not
+	 * fit in a command's single 32-bit value. It is answered with no reply
+	 * because the host sends it and moves on, exactly as it does to the
+	 * ESP32-C6. */
+	if (type == (uint8_t)SN_FRAME_BLE_FILTER) {
+		sn_radio_ble_set_filter(payload, len);
+		return;
+	}
+	if (type != (uint8_t)SN_FRAME_CONTROL_CMD) {
+		return;
+	}
 	if (len < SN_CMD_PAYLOAD_LEN) {
 		return;
 	}

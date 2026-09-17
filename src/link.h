@@ -16,10 +16,16 @@ int sn_link_init(void);
  * Returns 0 on success. */
 int sn_link_send(sn_frame_type_t type, const uint8_t *payload, size_t len);
 
-/* Called for the payload of each SN_FRAME_CONTROL_CMD that arrives. Runs on
- * the link's reader thread, never in an ISR, so it may block briefly. */
-typedef void (*sn_command_handler_t)(const uint8_t *payload, size_t len);
-void sn_link_set_command_handler(sn_command_handler_t handler);
+/* Called for each frame the host sends, with its type, so one handler can
+ * route them. The type is passed rather than assumed because the host sends
+ * more than commands: BLE_FILTER carries an accept list, and a second setter
+ * per frame type would multiply with every one added.
+ *
+ * Runs on the link's reader thread, never in an ISR, so it may block
+ * briefly. */
+typedef void (*sn_frame_handler_t)(uint8_t type, const uint8_t *payload,
+				   size_t len);
+void sn_link_set_frame_handler(sn_frame_handler_t handler);
 
 /* Counters for the STATS frame. Kept here because this is the only place that
  * knows what actually reached the wire. */
