@@ -70,7 +70,14 @@ static uint8_t out[sizeof(struct sn_ble_meta) + SN_BLE_MAX_PACKET];
 #define BLE_BATCH_BUF      2048
 #define BLE_MAX_ENTRIES    32
 #define BLE_BATCH_HDR_LEN  9   /* u64 base timestamp, u8 count */
-#define BLE_ENTRY_LEN      6   /* u16 dt, u16 orig_len, u8 flags, u8 len */
+/* u16 dt, u16 orig_len, u8 flags, u16 len.
+ *
+ * The length is sixteen bits because an HCI event does not fit in eight: its
+ * own parameter-length field is a byte, so the H4 packet reaches 258 -- a type
+ * byte, a two-byte header and 255 of parameters. An eight-bit field wrapped
+ * modulo 256 and the host lost alignment part-way through a batch, reporting
+ * trailing bytes and naming nothing that pointed at the length. */
+#define BLE_ENTRY_LEN      7
 
 static uint8_t bbuf[BLE_BATCH_BUF];
 static size_t bused = BLE_BATCH_HDR_LEN;
@@ -153,9 +160,11 @@ static void ble_flush_locked(void)
 		const uint8_t *entry = bbuf + BLE_BATCH_HDR_LEN;
 		const uint16_t orig_len =
 			(uint16_t)(entry[2] | ((uint16_t)entry[3] << 8));
+		const uint16_t len =
+			(uint16_t)(entry[5] | ((uint16_t)entry[6] << 8));
 
 		send_alone(bbase_us, orig_len, entry[4],
-			   entry + BLE_ENTRY_LEN, entry[5]);
+			   entry + BLE_ENTRY_LEN, len);
 		bcount = 0u;
 		bused = BLE_BATCH_HDR_LEN;
 		return;
@@ -224,7 +233,8 @@ static void forward(struct net_buf *buf)
 	at[2] = (uint8_t)(full & 0xFFu);
 	at[3] = (uint8_t)(full >> 8);
 	at[4] = flags;
-	at[5] = (uint8_t)take;
+	at[5] = (uint8_t)(take & 0xFFu);
+	at[6] = (uint8_t)(take >> 8);
 	/* The H4 type byte is not in the buffer in raw mode, so it goes back
 	 * on the front here -- the host's dissector expects H4 framing. */
 	at[BLE_ENTRY_LEN] = H4_EVENT;

@@ -55,9 +55,27 @@ void sn_batch_flush(void);
 
 /* How long an incomplete batch waits for company before it is sent anyway.
  *
- * Bounds the latency a batch can add. It is also what keeps the 16-bit delta
- * field from ever overflowing in practice: a gap wider than 65535 us closes a
- * batch, and this timer closes one long before such a gap can open. The
- * overflow is still checked, because correctness should not rest on a timer
- * having been scheduled promptly. */
+ * Bounds the latency a batch can add. Capture timestamps are unaffected --
+ * every packet keeps its own, and Wireshark shows capture time rather than
+ * arrival time -- so this is latency on screen and nothing else.
+ *
+ * 20 ms, and raising it was TRIED and reverted. The arithmetic says a longer
+ * linger is free: simulated over 718 real packets, per-packet overhead falls
+ * from 16.3 bytes at 20 ms to 11.2 at 50. Measured on the wire it is not
+ * free at all, because bigger batches mean bigger frames and this link is
+ * bridged by a SAMD11 that cannot take long uninterrupted bursts at 1 Mbaud:
+ *
+ *     linger  max frame  corrupt batches  resyncs  bytes discarded
+ *      20 ms      426 B                0        0                0
+ *      50 ms     1751 B                3        5             1491
+ *
+ * Twenty-five seconds each, same air. link.c documents the same bridge
+ * losing 9 bytes mid-way through a 266-byte frame; 1751 is six times that.
+ *
+ * So the ceiling here is not the line rate and not the batch rate. It is how
+ * much the bridge will swallow in one go, and a batch that grows past it
+ * loses more packets than the saved bytes were worth. Anything that makes
+ * frames longer -- a wider delta field, compression with a shared window --
+ * runs into the same wall and should be measured against it before it is
+ * believed. */
 #define SN_BATCH_LINGER_MS 20
