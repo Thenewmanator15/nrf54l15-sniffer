@@ -63,10 +63,14 @@ static uint32_t captured;
 static uint8_t filter[MAX_FILTER][FILTER_ENTRY];
 static uint8_t filter_count;
 
-/* Periodic advertising. The controller holds a limited number of syncs and
- * refuses the rest; this is the count the SoftDevice Controller is configured
- * for, so asking for more would only generate refusals. */
-#define MAX_SYNCS 2
+/* Periodic advertising. This is the count the SoftDevice Controller is
+ * configured for, and it is one: NCS's hci_driver sets
+ * SDC_PERIODIC_ADV_SYNC_COUNT from CONFIG_BT_PER_ADV_SYNC_MAX, which defaults
+ * to 1, and prj.conf does not set it. Asking for a second sync only produces
+ * a refusal, and a refusal leaves the count where it was -- so every later
+ * repeat of that train's advertisement asks again. If this ever needs to be
+ * two, raise CONFIG_BT_PER_ADV_SYNC_MAX first. */
+#define MAX_SYNCS 1
 static bool periodic_enabled;
 static uint8_t sync_count;
 
