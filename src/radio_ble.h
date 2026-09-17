@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -72,6 +73,19 @@ int sn_radio_ble_stop(void);
  * Stored rather than applied: the list is loaded when a scan starts, because
  * the controller is reset at that point and forgets it. */
 void sn_radio_ble_set_filter(const uint8_t *payload, size_t len);
+
+/* Follows periodic advertising trains as they are noticed.
+ *
+ * An extended advertisement carries the interval of its periodic train, if it
+ * has one. With this on, the firmware asks the controller to sync to each
+ * train it sees, and the periodic reports then arrive as ordinary HCI events
+ * and are forwarded like everything else -- which is how LE Audio and
+ * Auracast broadcasts become visible at all.
+ *
+ * Off by default. Syncing costs receive windows the scanner would otherwise
+ * spend on advertisements, so a capture that does not want periodic traffic
+ * should not pay for it. */
+void sn_radio_ble_set_periodic(bool enable);
 
 /* Counters for the STATS frame. */
 uint32_t sn_radio_ble_captured(void);

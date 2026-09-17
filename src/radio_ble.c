@@ -1,6 +1,7 @@
 #include "radio_ble.h"
 
 #include <errno.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include <zephyr/kernel.h>
@@ -45,6 +46,7 @@
 #define UNITS_PER_MS(ms) ((uint16_t)(((uint32_t)(ms) * 1000u) / 625u))
 
 static int apply_filter(void);
+static void note_periodic(const uint8_t *hci, uint16_t len);
 
 static K_FIFO_DEFINE(hci_rx);
 static bool running;
@@ -55,6 +57,28 @@ static uint32_t captured;
 #define FILTER_ENTRY 7   /* address type, then six bytes of address */
 static uint8_t filter[MAX_FILTER][FILTER_ENTRY];
 static uint8_t filter_count;
+
+/* Periodic advertising. The controller holds a limited number of syncs and
+ * refuses the rest; this is the count the SoftDevice Controller is configured
+ * for, so asking for more would only generate refusals. */
+#define MAX_SYNCS 2
+static bool periodic_enabled;
+static uint8_t sync_count;
+
+struct sync_req {
+	uint8_t sid;
+	uint8_t addr_type;
+	uint8_t addr[6];
+};
+
+/* Requests are handed to a work item rather than issued where the
+ * advertisement is seen: that runs on the thread draining HCI events, and a
+ * command there would stall forwarding for as long as the controller took to
+ * answer. Four deep because every repeat of an advertisement queues another
+ * request until the sync is established. */
+K_MSGQ_DEFINE(sync_q, sizeof(struct sync_req), 4, 4);
+static void sync_work_fn(struct k_work *work);
+static K_WORK_DEFINE(sync_work, sync_work_fn);
 static uint32_t dropped;
 
 /* The forwarding thread. Its own stack rather than the system work queue's:
@@ -217,6 +241,22 @@ static void forward(struct net_buf *buf)
 	}
 
 	const uint64_t ts = now_us();
+
+	/* Before batching, because this reads the event rather than the copy,
+	 * and because a train noticed late is a train not followed. */
+	if (periodic_enabled) {
+		/* The H4 byte is not in the buffer, so a one-byte shim keeps
+		 * the offsets the same as everywhere else that reads an HCI
+		 * packet. */
+		static uint8_t peek[32];
+		const uint16_t n = buf->len + 1u > sizeof(peek)
+				 ? (uint16_t)sizeof(peek)
+				 : (uint16_t)(buf->len + 1u);
+
+		peek[0] = H4_EVENT;
+		memcpy(peek + 1, buf->data, n - 1u);
+		note_periodic(peek, n);
+	}
 
 	k_mutex_lock(&block, K_FOREVER);
 
@@ -423,10 +463,77 @@ int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys)
 		return err;
 	}
 
+	/* A fresh scan is a fresh controller: the reset above dropped any
+	 * syncs it held, so the count has to follow it down or no new train
+	 * would ever be followed. */
+	sync_count = 0u;
+	k_msgq_purge(&sync_q);
+
 	/* Set last: everything above is configuration, and forwarding it
 	 * would put our own command completes in the capture. */
 	running = true;
 	return 0;
+}
+
+void sn_radio_ble_set_periodic(bool enable)
+{
+	periodic_enabled = enable;
+}
+
+static void sync_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	struct sync_req req;
+
+	while (k_msgq_get(&sync_q, &req, K_NO_WAIT) == 0) {
+		if (!periodic_enabled || sync_count >= MAX_SYNCS) {
+			continue;
+		}
+
+		/* options 0: use the address given rather than the
+		 * controller's advertiser list, and report from the start.
+		 * skip 0, timeout 10 s in 10 ms units, no CTE constraint. */
+		uint8_t params[14] = {0};
+
+		params[1] = req.sid;
+		params[2] = req.addr_type;
+		memcpy(params + 3, req.addr, sizeof(req.addr));
+		params[11] = 0xE8u;
+		params[12] = 0x03u;
+
+		if (send_command(BT_HCI_OP_LE_PER_ADV_CREATE_SYNC,
+				 params, sizeof(params)) == 0) {
+			sync_count++;
+		}
+		/* A refusal is ordinary rather than an error: the controller
+		 * rejects a duplicate sync to a train it already follows, and
+		 * every repeat of that advertisement queues another request. */
+	}
+}
+
+/* Notices a periodic train in an extended advertising report and asks for a
+ * sync. Called with the HCI event, from the forwarding thread. */
+static void note_periodic(const uint8_t *hci, uint16_t len)
+{
+	/* H4, event code, length, subevent, num_reports, then a report whose
+	 * periodic interval sits 14 bytes in. Zero means no train. */
+	if (len < 21u || hci[1] != 0x3Eu || hci[3] != 0x0Du) {
+		return;
+	}
+	if ((hci[19] | ((uint16_t)hci[20] << 8)) == 0u) {
+		return;
+	}
+
+	struct sync_req req = {
+		.sid = hci[16],
+		.addr_type = hci[7],
+	};
+
+	memcpy(req.addr, hci + 8, sizeof(req.addr));
+	if (k_msgq_put(&sync_q, &req, K_NO_WAIT) == 0) {
+		k_work_submit(&sync_work);
+	}
 }
 
 void sn_radio_ble_set_filter(const uint8_t *payload, size_t len)

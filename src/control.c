@@ -118,6 +118,13 @@ void sn_control_handle(uint8_t type, const uint8_t *payload, size_t len)
 		reply(command, SN_STATUS_OK, value);
 		break;
 
+	case SN_CMD_SET_BLE_PERIODIC:
+		/* Stored in the radio rather than here, because it is read on
+		 * the path that sees each advertisement. */
+		sn_radio_ble_set_periodic(value != 0u);
+		reply(command, SN_STATUS_OK, value);
+		break;
+
 	case SN_CMD_SET_BLE_SCAN:
 		/* Interval in the low 16 bits, window in the high 16, as
 		 * capture.py packs them. Stored rather than applied: the host
