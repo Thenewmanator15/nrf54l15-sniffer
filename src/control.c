@@ -26,11 +26,32 @@
 #include "frame.h"
 #include "link.h"
 #include "radio154.h"
+#include "radio_ble.h"
 
 LOG_MODULE_REGISTER(control, LOG_LEVEL_INF);
 
 #define SN_CMD_PAYLOAD_LEN   5
 #define SN_REPLY_PAYLOAD_LEN 6
+
+/* From esp32c6_sniffer.control.Radio. BLE is 2, not 1 -- 1 is Wi-Fi, which
+ * this part does not have. Guessing 1 here made the board accept a request
+ * for Wi-Fi as though it were BLE and refuse the real thing, and the host
+ * reported only "SET_RADIO failed, status 2". */
+#define RADIO_154 0u
+#define RADIO_WIFI 1u
+#define RADIO_BLE 2u
+
+/* Which radio the host selected. SET_CHANNEL, START and STOP are all
+ * interpreted against it, so it is tracked rather than inferred: a START that
+ * guessed wrong would start the other radio and capture nothing the operator
+ * asked for. */
+static uint8_t selected_radio = RADIO_154;
+
+/* Held until START, because the host sends them before it. Zero means "not
+ * set", which the radio turns into its default. */
+static uint16_t ble_interval_ms;
+static uint16_t ble_window_ms;
+static uint8_t ble_phys = 1u;   /* the 1M PHY, which every advertiser uses */
 
 static void reply(uint8_t command, uint8_t status, uint32_t value)
 {
@@ -60,17 +81,52 @@ void sn_control_handle(const uint8_t *payload, size_t len)
 	switch (command) {
 	case SN_CMD_SET_RADIO:
 		/* The host selects a radio before anything else, because
-		 * SET_CHANNEL is interpreted against whichever is selected.
-		 * This board has one: 802.15.4 is Radio.IEEE802154 == 0 in
-		 * esp32c6_sniffer.control. Wi-Fi does not exist on this part
-		 * at all and BLE has no firmware behind it, so both are
-		 * refused rather than quietly accepted. */
-		reply(command,
-		      value == 0u ? SN_STATUS_OK : SN_STATUS_BAD_VALUE,
-		      value);
+		 * SET_CHANNEL, START and STOP are interpreted against
+		 * whichever is selected.
+		 *
+		 * Two exist here. Wi-Fi is RADIO_WIFI and does not exist on
+		 * this part at all, so it is refused rather than quietly
+		 * accepted. */
+		if (value != RADIO_154 && value != RADIO_BLE) {
+			reply(command, SN_STATUS_BAD_VALUE, value);
+			break;
+		}
+		selected_radio = (uint8_t)value;
+		reply(command, SN_STATUS_OK, value);
+		break;
+
+	case SN_CMD_SET_BLE_PHYS:
+		/* 1 is the 1M PHY, 4 adds Coded. Zero would ask the controller
+		 * to scan on no PHY, which it accepts and which hears nothing,
+		 * so it is refused here rather than at the radio. */
+		if (value == 0u || value > 0xFFu) {
+			reply(command, SN_STATUS_BAD_VALUE, value);
+			break;
+		}
+		ble_phys = (uint8_t)value;
+		reply(command, SN_STATUS_OK, value);
+		break;
+
+	case SN_CMD_SET_BLE_SCAN:
+		/* Interval in the low 16 bits, window in the high 16, as
+		 * capture.py packs them. Stored rather than applied: the host
+		 * sends this before START, and the controller takes both in
+		 * one command when scanning is configured. */
+		ble_interval_ms = (uint16_t)(value & 0xFFFFu);
+		ble_window_ms = (uint16_t)(value >> 16);
+		reply(command, SN_STATUS_OK, value);
 		break;
 
 	case SN_CMD_SET_CHANNEL:
+		/* BLE has no channel: the controller rotates the three
+		 * advertising channels itself, and the host knows this and
+		 * sends START instead. Arriving here means the host and the
+		 * board disagree about the selected radio, which is worth a
+		 * refusal rather than retuning a radio nobody asked about. */
+		if (selected_radio == RADIO_BLE) {
+			reply(command, SN_STATUS_BAD_VALUE, value);
+			break;
+		}
 		/* SET_CHANNEL starts the radio, which is what the host
 		 * expects: for 802.15.4 it sends no separate START, and the
 		 * comment in capture.py's _configure says so explicitly.
@@ -96,12 +152,31 @@ void sn_control_handle(const uint8_t *payload, size_t len)
 		break;
 
 	case SN_CMD_START:
+		if (selected_radio == RADIO_BLE) {
+			const int err = sn_radio_ble_start(ble_interval_ms,
+							   ble_window_ms,
+							   ble_phys);
+
+			if (err != 0) {
+				LOG_ERR("BLE scan would not start: %d", err);
+			}
+			reply(command,
+			      err == 0 ? SN_STATUS_OK : SN_STATUS_FAILED, 0u);
+			break;
+		}
 		reply(command,
 		      sn_radio154_start() == 0 ? SN_STATUS_OK : SN_STATUS_FAILED,
 		      0u);
 		break;
 
 	case SN_CMD_STOP:
+		if (selected_radio == RADIO_BLE) {
+			reply(command,
+			      sn_radio_ble_stop() == 0 ? SN_STATUS_OK
+						       : SN_STATUS_FAILED,
+			      0u);
+			break;
+		}
 		reply(command,
 		      sn_radio154_stop() == 0 ? SN_STATUS_OK : SN_STATUS_FAILED,
 		      0u);

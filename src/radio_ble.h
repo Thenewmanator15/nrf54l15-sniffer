@@ -1,0 +1,63 @@
+#pragma once
+
+#include <stdint.h>
+
+/* Bluetooth LE advertisement capture on the nRF54L15.
+ *
+ * Advertisements only. This cannot follow a connection: doing that means
+ * locking onto a connection request and hopping the data channels with it,
+ * which needs link-layer access the controller does not expose over HCI. A
+ * device that connects goes quiet here the moment it stops advertising.
+ *
+ * Passive scanning only: the controller never transmits a scan request, so
+ * the sniffer stays silent. Scan responses therefore appear only when some
+ * other device solicits them, which is the trade for not announcing yourself,
+ * and is why the Name column in Wireshark is usually empty.
+ *
+ * The controller runs WITHOUT a host stack -- CONFIG_BT_HCI_RAW -- and is
+ * driven straight over HCI, exactly as the ESP32-C6 firmware drives its own.
+ * What reaches the host is the controller's own HCI events byte for byte, so
+ * Wireshark dissects them with its HCI dissector rather than anything invented
+ * here, and both boards produce the same bytes for the same air traffic.
+ */
+
+/* Metadata prepended to each forwarded HCI packet, 12 bytes, little-endian.
+ * The HCI packet itself follows, starting with its H4 packet-type byte.
+ *
+ * Byte-identical to sn_ble_meta_t in the ESP32-C6 firmware, because the host
+ * unpacks both with one "<QHBB" in esp32c6_sniffer/ble.py. A field that moves
+ * here decodes into a confident wrong number there rather than an error. */
+struct __attribute__((packed)) sn_ble_meta {
+	uint64_t timestamp_us;  /* arrival at this firmware, microseconds up */
+	uint16_t orig_len;      /* H4 packet length before any truncation */
+	uint8_t flags;
+	uint8_t reserved;
+};
+
+#define SN_BLE_FLAG_TRUNCATED 0x01u
+
+/* Largest H4 packet forwarded, counting the type byte. An extended
+ * advertising report can be long; anything past this is truncated and flagged
+ * rather than dropped, because a truncated advertisement still carries its
+ * address and RSSI. */
+#define SN_BLE_MAX_PACKET 300
+
+/* Scan defaults, matching the ESP32-C6 firmware. A window equal to the
+ * interval is continuous scanning. */
+#define SN_BLE_DEFAULT_INTERVAL_MS 60
+#define SN_BLE_DEFAULT_WINDOW_MS   60
+
+/* Brings up the controller and starts forwarding its events. Returns 0, or a
+ * negative errno if the controller will not start. */
+int sn_radio_ble_init(void);
+
+/* Starts passive scanning. `phys` is a bitmask: 1 is the 1M PHY, 4 adds Coded
+ * (long range); 0 is rejected rather than silently treated as 1M. Interval and
+ * window are in milliseconds, as the host sends them. */
+int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys);
+
+int sn_radio_ble_stop(void);
+
+/* Counters for the STATS frame. */
+uint32_t sn_radio_ble_captured(void);
+uint32_t sn_radio_ble_dropped(void);

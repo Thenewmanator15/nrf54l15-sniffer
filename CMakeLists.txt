@@ -21,6 +21,7 @@ target_sources(app PRIVATE
     src/main.c
     src/link.c
     src/radio154.c
+    src/radio_ble.c
     src/control.c
     src/batch.c
     src/log_backend_sn.c

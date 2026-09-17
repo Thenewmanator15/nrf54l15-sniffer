@@ -11,13 +11,14 @@
 #include "frame.h"
 #include "link.h"
 #include "radio154.h"
+#include "radio_ble.h"
 
 /* Wire format this firmware speaks. Must match the nrf54l15 entry in
  * EXPECTED_FIRMWARE_VERSIONS in host/src/esp32c6_sniffer/capture.py; the host
  * refuses to open a capture until the two agree, because an older board packs
  * its metadata differently and every field would then decode to a confident
  * wrong number rather than an error. */
-#define SN_FIRMWARE_VERSION 1u
+#define SN_FIRMWARE_VERSION 2u
 
 LOG_MODULE_REGISTER(sniffer, LOG_LEVEL_INF);
 
@@ -162,6 +163,17 @@ int main(void)
 #elif SN_MODE == SN_MODE_CAPTURE
 	if (sn_radio154_init() != 0) {
 		return -1;
+	}
+	/* The controller is brought up but not scanning. Both radios are
+	 * initialised at boot and neither is receiving: which one runs is the
+	 * host's choice, made with SET_RADIO, and they share one antenna so
+	 * only one can run at a time regardless.
+	 *
+	 * A failure here is not fatal to 802.15.4 capture, which is the
+	 * radio this board was built for, so it is reported and stepped over
+	 * rather than taking the firmware down with it. */
+	if (sn_radio_ble_init() != 0) {
+		LOG_ERR("Bluetooth controller would not start; 802.15.4 only");
 	}
 	sn_link_set_command_handler(sn_control_handle);
 
