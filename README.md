@@ -32,6 +32,87 @@ when something else on the board logs. Read
 concluding the radio is broken again -- it is the first thing to suspect, and
 it cost several nights the first time.
 
+## Limitations
+
+Most of these are the board rather than the firmware, and none of them is a
+plan to fix something. They are here so nobody spends an evening finding one
+out.
+
+**One radio.** IEEE 802.15.4 only, channels 11 to 26. Wi-Fi does not exist on
+this part, and BLE has no firmware behind it. Both are *refused* when the host
+asks for them rather than accepted and quietly ignored.
+
+**The link is a UART, not USB, and it is the ceiling.** The nRF54L15 has no USB
+device controller, so the host is reached through the board's SAMD11 bridge.
+Measured end to end: **94.3 kB/s**, against roughly **810 kB/s** for the
+ESP32-C6 over real USB. That is the single biggest difference between the two
+boards. 1 Mbaud is the UARTE's ceiling on this part, so it cannot simply be
+raised; the overlay in `boards/` fixes it there and the plugin already matches.
+
+**The bridge drops bytes at that rate, and the fix is a mitigation.** Long
+uninterrupted runs at 1 Mbaud lost 9 bytes mid-frame, twice, and none in an
+identical second run -- about 90 us of the bridge not draining. EasyDMA streams
+at exactly line rate and removed the accidental gaps that per-byte writes used
+to leave, which is what exposed it. Transfers are therefore capped at 64 bytes
+with a deliberate 20 us gap, costing about 3% of line rate. That has held, but
+it is a workaround for a bridge that is not ours, not a guarantee.
+
+**Every packet costs 22 bytes of overhead**: a 10-byte frame header and 12
+bytes of metadata, so a 5-byte acknowledgement travels as 27. `PACKET_BATCH`
+exists in the wire format to amortise exactly that, and this firmware does not
+yet emit it. Ordinary traffic has room to spare against 94 kB/s; a channel
+saturated with minimum-size frames is the case that does not.
+
+**Frames that fail their checksum never arrive.** The driver validates and
+strips the FCS before this firmware sees anything, so a capture cannot show
+malformed or corrupted frames -- only that a gap exists where one might have
+been. PSDUs are capped at 127 bytes, which is the standard's own limit.
+
+**The onboard antenna only.** The board has an RF switch, but which position
+selects which antenna is not established and the gain difference has not been
+measured, so asking for the external antenna is refused rather than accepted
+and ignored.
+
+**No energy survey, no snaplen, no hardware filter, no trace.** The wire format
+carries commands for all of these and the ESP32-C6 implements them; here they
+return `SN_STATUS_UNKNOWN_COMMAND`. In particular there is no spectrum survey,
+so "which channel is busy?" has to be answered with a capture.
+
+**Drop accounting is partial.** Frames refused because the outbound ring was
+full are counted and reported. Short writes and transmit stalls are always
+reported as zero, because this link cannot detect them -- reporting anything
+else would invent a measurement.
+
+**Timestamp accuracy is uncharacterised.** Timestamps come from the driver's
+own packet timestamp at microsecond resolution. The ~0.5 us figure measured on
+the ESP32-C6, against the standard's fixed acknowledgement turnaround, has not
+been reproduced on this board. Do not quote it for this one.
+
+**Reception is unsupported by Nordic and has been layout-sensitive.** Their
+position, at the time of writing:
+
+> There is currently no support for using nRF54L15 as a sniffer, though that
+> is a request that Nordic is looking into, but they cannot promise or provide
+> a timeline for this.
+
+Two binaries with byte-identical Kconfig were observed to behave differently.
+`CONFIG_IEEE802154_NRF5_RX_STACK_SIZE=2048` is load-bearing rather than a
+tuning choice: the driver's RX thread defaults to 800 bytes and was measured at
+792 used, and anything that grows it stops reception **silently** -- start
+returns success, the channel reads back, promiscuous reads back true, and no
+frame ever arrives. If frames stop after an unrelated change, read
+[docs/2026-09-14-nrf54l15-spike.md](docs/2026-09-14-nrf54l15-spike.md) before
+suspecting anything else.
+
+**The plugin is in another repository.** Its firmware-version check therefore
+spans two repositories: if a capture is refused for a version mismatch, take a
+newer hex from this repository's releases rather than assuming the plugin is
+wrong.
+
+**It transmits nothing.** Auto-acknowledgement is off and the radio is in
+promiscuous receive. That is a design constraint, not an omission -- there is
+no active scan, no injection and no association.
+
 ## Toolchain
 
 nRF Connect SDK **v3.4.0** (Zephyr 4.4.0, west 1.5.0), installed with
