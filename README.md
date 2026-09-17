@@ -38,9 +38,27 @@ Most of these are the board rather than the firmware, and none of them is a
 plan to fix something. They are here so nobody spends an evening finding one
 out.
 
-**One radio.** IEEE 802.15.4 only, channels 11 to 26. Wi-Fi does not exist on
-this part, and BLE has no firmware behind it. Both are *refused* when the host
-asks for them rather than accepted and quietly ignored.
+**Two radios, not three.** IEEE 802.15.4, channels 11 to 26, and Bluetooth LE
+advertisements. Wi-Fi does not exist on this part and is *refused* when the
+host asks for it, rather than accepted and quietly ignored.
+
+**BLE here is a scanner, not a link-layer sniffer.** Advertisements, scan
+responses, and the periodic trains that carry Auracast; never a connection,
+which needs link-layer access the controller does not expose over HCI. Two
+further ceilings, neither of them configuration:
+
+- **One periodic sync at a time.** `CONFIG_BT_PER_ADV_SYNC_MAX` defaults to 1
+  and `prj.conf` does not raise it, so one is what the SoftDevice Controller
+  is built with. Asking for a second produces a refusal and nothing else.
+- **No direction finding.** The SoftDevice Controller offers
+  `sdc_support_le_connectionless_cte_transmitter` and no receiving
+  counterpart, so AoA and AoD are out whatever antenna is attached.
+
+What this board has and the ESP32-C6 does not is LE Audio. A periodic train
+carrying a broadcast also carries BIGInfo, and this firmware joins the
+isochronous group it describes and forwards the audio as ISO packets. The C6's
+silicon has no isochronous channels at all, so it can name a broadcast and
+never hear it.
 
 **The link is a UART, not USB, and it is the ceiling.** The nRF54L15 has no USB
 device controller, so the host is reached through the board's SAMD11 bridge.
@@ -93,6 +111,11 @@ is coming. Short writes and transmit stalls are always reported as zero,
 because this link cannot detect them: reporting anything else would invent a
 measurement, and a zero meaning "none" is indistinguishable from a zero meaning
 "cannot tell".
+
+The same applies to three of the eleven BLE counters. There is no intermediate
+receive queue here to overflow, and `send_command` does not wait for the
+controller to answer, so queue-full and command-timeout figures go out as
+zeros that mean "cannot tell" rather than "none". The header says which.
 
 **Timestamp accuracy is uncharacterised.** Timestamps come from the driver's
 own packet timestamp at microsecond resolution. The ~0.5 us figure measured on
