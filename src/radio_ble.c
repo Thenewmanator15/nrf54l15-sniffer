@@ -11,6 +11,9 @@
 #include <zephyr/bluetooth/hci_raw.h>
 #include <zephyr/bluetooth/hci_types.h>
 
+/* For SN_BATCH_LINGER_MS: both radios linger the same, so a capture does
+ * not change character when the radio does. */
+#include "batch.h"
 #include "frame.h"
 #include "link.h"
 
@@ -57,6 +60,27 @@ static struct k_thread fwd_thread;
 /* Staging for one forwarded packet: metadata, the H4 type byte, the event. */
 static uint8_t out[sizeof(struct sn_ble_meta) + SN_BLE_MAX_PACKET];
 
+/* Batching, for the same reason the 802.15.4 path has it: a BLE packet sent
+ * alone costs 22 bytes of overhead against a 94 kB/s link.
+ *
+ * Bounded by BYTES rather than by the worst case in entries. Thirty-two
+ * maximum-length HCI events would need nearly 10 KB of buffer for a case that
+ * does not occur -- advertising reports here run 47 to 60 bytes -- so this
+ * holds about thirty typical ones and closes early if they are large. */
+#define BLE_BATCH_BUF      2048
+#define BLE_MAX_ENTRIES    32
+#define BLE_BATCH_HDR_LEN  9   /* u64 base timestamp, u8 count */
+#define BLE_ENTRY_LEN      6   /* u16 dt, u16 orig_len, u8 flags, u8 len */
+
+static uint8_t bbuf[BLE_BATCH_BUF];
+static size_t bused = BLE_BATCH_HDR_LEN;
+static uint8_t bcount;
+static uint64_t bbase_us;
+static uint64_t blast_us;
+static K_MUTEX_DEFINE(block);
+static void ble_linger_expired(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(ble_linger, ble_linger_expired);
+
 static uint64_t now_us(void)
 {
 	/* Arrival at this firmware, not at the antenna: the controller does
@@ -94,6 +118,73 @@ static int send_command(uint16_t opcode, const uint8_t *params, uint8_t len)
 	return err;
 }
 
+/* Sends one packet on its own. The caller holds the lock. */
+static void send_alone(uint64_t timestamp_us, uint16_t orig_len, uint8_t flags,
+		       const uint8_t *hci, uint16_t len)
+{
+	const struct sn_ble_meta meta = {
+		.timestamp_us = timestamp_us,
+		.orig_len = orig_len,
+		.flags = flags,
+		.reserved = 0u,
+	};
+
+	memcpy(out, &meta, sizeof(meta));
+	memcpy(out + sizeof(meta), hci, len);
+
+	if (sn_link_send(SN_FRAME_PACKET, out, sizeof(meta) + len) != 0) {
+		dropped++;
+	}
+}
+
+/* Sends the open batch. The caller holds the lock. */
+static void ble_flush_locked(void)
+{
+	if (bcount == 0u) {
+		return;
+	}
+
+	/* A batch of one is sent as a PACKET, because as a batch it would be
+	 * BIGGER: 10 bytes of frame header, 9 of batch header and a 6-byte
+	 * entry is 25, against 22 for a PACKET and its metadata. The same
+	 * arithmetic as the 802.15.4 path, and the same reason -- on a quiet
+	 * channel most batches close with one packet in them. */
+	if (bcount == 1u) {
+		const uint8_t *entry = bbuf + BLE_BATCH_HDR_LEN;
+		const uint16_t orig_len =
+			(uint16_t)(entry[2] | ((uint16_t)entry[3] << 8));
+
+		send_alone(bbase_us, orig_len, entry[4],
+			   entry + BLE_ENTRY_LEN, entry[5]);
+		bcount = 0u;
+		bused = BLE_BATCH_HDR_LEN;
+		return;
+	}
+
+	for (int i = 0; i < 8; i++) {
+		bbuf[i] = (uint8_t)(bbase_us >> (8 * i));
+	}
+	bbuf[8] = bcount;
+
+	/* Counted in packets, not frames: a refused batch is every packet in
+	 * it, and reporting one drop would understate the loss. */
+	if (sn_link_send(SN_FRAME_BLE_BATCH, bbuf, bused) != 0) {
+		dropped += bcount;
+	}
+
+	bcount = 0u;
+	bused = BLE_BATCH_HDR_LEN;
+}
+
+static void ble_linger_expired(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	k_mutex_lock(&block, K_FOREVER);
+	ble_flush_locked();
+	k_mutex_unlock(&block);
+}
+
 static void forward(struct net_buf *buf)
 {
 	/* One more byte than the event, for the H4 type put back on the
@@ -107,22 +198,54 @@ static void forward(struct net_buf *buf)
 		flags |= SN_BLE_FLAG_TRUNCATED;
 	}
 
-	const struct sn_ble_meta meta = {
-		.timestamp_us = now_us(),
-		.orig_len = full,
-		.flags = flags,
-		.reserved = 0u,
-	};
+	const uint64_t ts = now_us();
 
-	memcpy(out, &meta, sizeof(meta));
-	out[sizeof(meta)] = H4_EVENT;
-	memcpy(out + sizeof(meta) + 1, buf->data, take - 1u);
+	k_mutex_lock(&block, K_FOREVER);
 
-	captured++;
-	if (sn_link_send(SN_FRAME_PACKET, out,
-			 sizeof(meta) + take) != 0) {
-		dropped++;
+	/* Close the open batch if this packet cannot join it: a delta too wide
+	 * for sixteen bits, a clock that went backwards, or not enough room
+	 * left. All three are conditions the host would refuse the frame for. */
+	if (bcount > 0u &&
+	    (ts < blast_us || ts - blast_us > 0xFFFFu ||
+	     bused + BLE_ENTRY_LEN + take > sizeof(bbuf))) {
+		ble_flush_locked();
 	}
+
+	if (bcount == 0u) {
+		bbase_us = ts;
+		blast_us = ts;
+	}
+
+	const uint16_t dt = (uint16_t)(ts - blast_us);
+	uint8_t *at = bbuf + bused;
+
+	at[0] = (uint8_t)(dt & 0xFFu);
+	at[1] = (uint8_t)(dt >> 8);
+	at[2] = (uint8_t)(full & 0xFFu);
+	at[3] = (uint8_t)(full >> 8);
+	at[4] = flags;
+	at[5] = (uint8_t)take;
+	/* The H4 type byte is not in the buffer in raw mode, so it goes back
+	 * on the front here -- the host's dissector expects H4 framing. */
+	at[BLE_ENTRY_LEN] = H4_EVENT;
+	memcpy(at + BLE_ENTRY_LEN + 1, buf->data, take - 1u);
+
+	bused += BLE_ENTRY_LEN + take;
+	blast_us = ts;
+	bcount++;
+	captured++;
+
+	if (bcount == BLE_MAX_ENTRIES) {
+		ble_flush_locked();
+		(void)k_work_cancel_delayable(&ble_linger);
+	} else {
+		/* Rescheduled per packet, so the timer measures silence rather
+		 * than the age of the batch. */
+		(void)k_work_reschedule(&ble_linger,
+					K_MSEC(SN_BATCH_LINGER_MS));
+	}
+
+	k_mutex_unlock(&block);
 }
 
 static void fwd_loop(void *a, void *b, void *c)
@@ -138,11 +261,21 @@ static void fwd_loop(void *a, void *b, void *c)
 			continue;
 		}
 
-		/* Only events, and only once scanning has been enabled. The
-		 * controller answers every setup command with a command
-		 * complete, and a capture should contain what the radio heard
-		 * rather than our own configuration. */
-		if (running && bt_buf_get_type(buf) == BT_BUF_EVT) {
+		/* Only events, only once scanning has been enabled, and never
+		 * the controller's answers to our own commands.
+		 *
+		 * The `running` flag alone is not enough. It is set after the
+		 * scan-enable command is sent, and that command's own Command
+		 * Complete arrives asynchronously afterwards -- so it raced
+		 * past the flag and appeared as frame 1 of a capture. Dropping
+		 * the two reply events by code does not depend on timing.
+		 *
+		 * A capture should contain what the radio heard. Nothing else
+		 * is lost: an advertisement arrives as an LE Meta event. */
+		if (running && bt_buf_get_type(buf) == BT_BUF_EVT &&
+		    buf->len > 0u &&
+		    buf->data[0] != BT_HCI_EVT_CMD_COMPLETE &&
+		    buf->data[0] != BT_HCI_EVT_CMD_STATUS) {
 			forward(buf);
 		}
 
@@ -271,6 +404,14 @@ int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys)
 int sn_radio_ble_stop(void)
 {
 	running = false;
+
+	/* Otherwise the last packets before a stop sit in the buffer until
+	 * something else happens to arrive, which on a stopped radio is
+	 * never. */
+	(void)k_work_cancel_delayable(&ble_linger);
+	k_mutex_lock(&block, K_FOREVER);
+	ble_flush_locked();
+	k_mutex_unlock(&block);
 
 	const uint8_t disable[6] = {0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u};
 
