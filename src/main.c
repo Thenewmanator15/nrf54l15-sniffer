@@ -85,13 +85,20 @@ static void conformance_burst(void)
 
 #if SN_MODE == SN_MODE_CAPTURE
 /* Published once a second, laid out exactly as the ESP-IDF firmware lays it
- * out: five link counters, three for the 802.15.4 radio, twelve for Wi-Fi and
- * eleven for BLE. The host reads all four blocks by position and decides from
- * the payload's length how many counters a given firmware sent.
+ * out: five link counters, three for the 802.15.4 radio, thirteen for Wi-Fi
+ * and eleven for BLE. The host reads all four blocks by position and decides
+ * from the payload's length how many counters a given firmware sent.
  *
- * The Wi-Fi block is twelve zeros and stays: this board has no Wi-Fi radio,
+ * The Wi-Fi block is thirteen zeros and stays: this board has no Wi-Fi radio,
  * but the BLE block sits behind that space and every counter in it would be
  * read as a Wi-Fi one if it were closed up.
+ *
+ * Thirteen because the C6's sn_80211_stats_t is thirteen wide -- it ends with
+ * fcs_length_unknown. This said twelve, copied from what the host once read
+ * rather than from what the C6 sends, and when the host was corrected to
+ * thirteen every BLE counter here moved one place: a board reporting more
+ * advertising reports than HCI packets, which a subset cannot be.
+ * test_stats_layout.py now checks this width against the C6's header.
  *
  * Sending BLE is new. The counters existed and reached nobody -- two
  * accessors that nothing called -- so a BLE capture here reported
@@ -116,7 +123,7 @@ struct sn_stats_full {
 	uint32_t frames_captured;
 	uint32_t isr_queue_full;
 	uint32_t link_rejected;
-	uint32_t wifi[12];
+	uint32_t wifi[13];
 	struct sn_ble_stats ble;
 };
 

@@ -272,10 +272,17 @@ static void note_counts(const uint8_t *evt, uint16_t len)
 	case BT_HCI_EVT_LE_EXT_ADVERTISING_REPORT:
 		adv_reports++;
 		break;
+	/* Both versions of both events. This controller sends only v2 --
+	 * measured following a train at 80 ms: one 0x24 and 365 0x25 in 30 s,
+	 * and not a single v1 -- so counting v1 alone reported every periodic
+	 * figure as zero while the train was being followed perfectly well.
+	 * Status leads in both versions, so one check serves. */
 	case BT_HCI_EVT_LE_PER_ADVERTISING_REPORT:
+	case BT_HCI_EVT_LE_PER_ADVERTISING_REPORT_V2:
 		periodic_reports++;
 		break;
 	case BT_HCI_EVT_LE_PER_ADV_SYNC_ESTABLISHED:
+	case BT_HCI_EVT_LE_PER_ADV_SYNC_ESTABLISHED_V2:
 		/* Its first parameter is a status, so this one event is both
 		 * the success and the failure report -- and the failure is the
 		 * only place a refusal can be seen here, because send_command
