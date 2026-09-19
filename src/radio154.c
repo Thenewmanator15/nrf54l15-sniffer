@@ -15,6 +15,7 @@
 #include "radio154.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 
 #include <zephyr/kernel.h>
@@ -33,6 +34,17 @@ static struct ieee802154_radio_api *api;
 
 static uint8_t current_channel = 11;
 static uint32_t captured;
+
+/* Whether a capture has the receiver, so an energy measurement knows what to
+ * put back afterwards: receiving, or asleep. */
+static volatile bool running;
+
+/* True while the radio is tuned away to measure energy. Every frame is tagged
+ * with current_channel, so one heard in that window would be recorded against
+ * the capture's channel while it was actually heard on another -- a confident
+ * wrong answer. Dropped instead, and not counted as captured: the radio was
+ * deliberately elsewhere, which is not loss. */
+static volatile bool measuring;
 
 /* The largest PSDU an 802.15.4 frame can carry. */
 #define SN_154_MAX_PSDU 127
@@ -77,12 +89,95 @@ int sn_radio154_set_channel(uint8_t channel)
 
 int sn_radio154_start(void)
 {
-	return api->start(radio);
+	const int err = api->start(radio);
+
+	if (err == 0) {
+		running = true;
+	}
+	return err;
 }
 
 int sn_radio154_stop(void)
 {
-	return api->stop(radio);
+	const int err = api->stop(radio);
+
+	if (err == 0) {
+		running = false;
+	}
+	return err;
+}
+
+static K_SEM_DEFINE(ed_done, 0, 1);
+static volatile int16_t ed_result;
+
+/* Runs in the driver's context when a measurement ends. Stores and signals and
+ * does nothing else: this driver's receive path has already been lost once to
+ * extra work on its thread -- see docs/2026-09-14-nrf54l15-spike.md. */
+static void ed_complete(const struct device *dev, int16_t max_ed)
+{
+	ARG_UNUSED(dev);
+	ed_result = max_ed;
+	k_sem_give(&ed_done);
+}
+
+int sn_radio154_energy_detect(uint8_t channel, uint32_t duration_symbols,
+			      int8_t *out_dbm)
+{
+	if (channel < 11u || channel > 26u || duration_symbols == 0u ||
+	    out_dbm == NULL) {
+		return -EINVAL;
+	}
+
+	/* Symbols are 16 us; the driver takes milliseconds. Rounded up, and
+	 * capped at what its uint16_t can carry. */
+	uint32_t ms = (duration_symbols * 16u + 999u) / 1000u;
+
+	if (ms > UINT16_MAX) {
+		ms = UINT16_MAX;
+	}
+
+	const bool was_running = running;
+	const uint8_t previous_channel = current_channel;
+
+	measuring = true;
+
+	/* Receiving first, whatever the state: a measurement is only
+	 * guaranteed to be accepted from the receive state, and starting one
+	 * from sleep is not something this driver's contract promises. */
+	int err = api->set_channel(radio, channel);
+
+	if (err == 0) {
+		err = api->start(radio);
+	}
+	if (err == 0) {
+		k_sem_reset(&ed_done);
+		err = api->ed_scan(radio, (uint16_t)ms, ed_complete);
+	}
+	if (err == 0) {
+		/* The driver's own header warns a measurement "can take
+		 * longer than requested", hence the margin. */
+		if (k_sem_take(&ed_done, K_MSEC(ms + 100u)) != 0) {
+			err = -ETIMEDOUT;
+		} else if (ed_result == SHRT_MAX) {
+			/* How this driver reports a failed measurement: in
+			 * place of a reading, not beside one. */
+			err = -EIO;
+		} else {
+			*out_dbm = (int8_t)CLAMP(ed_result, INT8_MIN, INT8_MAX);
+		}
+	}
+
+	/* Put the radio back exactly as it was, whether or not the
+	 * measurement worked. */
+	(void)api->set_channel(radio, previous_channel);
+	if (was_running) {
+		(void)api->start(radio);
+	} else {
+		(void)api->stop(radio);
+	}
+	measuring = false;
+
+	return err;
 }
 
 uint8_t sn_radio154_channel(void)
@@ -113,6 +208,11 @@ int net_recv_data(struct net_if *iface, struct net_pkt *pkt)
 	if (net_pkt_is_empty(pkt)) {
 		net_pkt_unref(pkt);
 		return -ENODATA;
+	}
+	if (measuring) {
+		/* Heard while tuned away to measure energy; see `measuring`. */
+		net_pkt_unref(pkt);
+		return 0;
 	}
 
 	const uint8_t *psdu = net_buf_frag_last(pkt->buffer)->data;

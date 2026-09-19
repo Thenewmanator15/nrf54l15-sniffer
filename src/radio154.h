@@ -24,6 +24,22 @@ int sn_radio154_stop(void);
 
 uint8_t sn_radio154_channel(void);
 
+/* Measures the energy on one channel and reports the peak in dBm, then puts
+ * the radio back exactly as it was: receiving on its own channel if a capture
+ * was running, asleep if not.
+ *
+ * `duration_symbols` is in 16 us symbols, as the wire format and the ESP32-C6
+ * carry it. The driver measures in whole milliseconds, so the window is
+ * rounded UP -- a peak found over a longer window can only be higher, which
+ * errs toward calling a channel busy rather than quiet.
+ *
+ * Blocks for the window plus a margin. The caller is the link reader thread,
+ * which is waiting for exactly this reply. Returns 0, -EINVAL for a channel or
+ * window that cannot be measured, or another negative errno if the driver
+ * would not measure. */
+int sn_radio154_energy_detect(uint8_t channel, uint32_t duration_symbols,
+			      int8_t *out_dbm);
+
 /* Counters for the STATS frame. */
 uint32_t sn_radio154_captured(void);
 uint32_t sn_radio154_dropped(void);

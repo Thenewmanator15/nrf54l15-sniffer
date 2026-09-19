@@ -99,10 +99,21 @@ selects which antenna is not established and the gain difference has not been
 measured, so asking for the external antenna is refused rather than accepted
 and ignored.
 
-**No energy survey, no snaplen, no hardware filter, no trace.** The wire format
-carries commands for all of these and the ESP32-C6 implements them; here they
-return `SN_STATUS_UNKNOWN_COMMAND`. In particular there is no spectrum survey,
-so "which channel is busy?" has to be answered with a capture.
+**No snaplen, no hardware filter, no trace.** The wire format carries commands
+for all of these and the ESP32-C6 implements them; here they return
+`SN_STATUS_UNKNOWN_COMMAND`.
+
+**The energy survey is here, at millisecond resolution.** Ported from Nordic's
+`802154_phy_test`, through Zephyr's radio API rather than the raw
+`nrf_802154_*` calls that sample makes, because Zephyr's driver already owns
+the callbacks those would need. The wire format asks for a window in 16 us
+symbols and the driver measures in whole milliseconds, so the window is
+rounded up: the host's 1250-symbol request is exactly 20 ms, but anything
+under a millisecond is measured for one. A peak over a longer window can only
+be higher, so the rounding errs toward calling a channel busy. A capture in
+progress is suspended for the measurement and resumed on its own channel, and
+any frame heard while the radio was tuned away is dropped rather than recorded
+against the wrong channel.
 
 **Drop accounting is partial.** Frames refused because the outbound ring was
 full are counted and reported, as is the ring's depth and the high-water mark

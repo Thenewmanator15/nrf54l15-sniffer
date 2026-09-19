@@ -19,6 +19,7 @@
 
 #include <zephyr/logging/log.h>
 
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -223,6 +224,42 @@ void sn_control_handle(uint8_t type, const uint8_t *payload, size_t len)
 		      value == 0u ? SN_STATUS_OK : SN_STATUS_BAD_VALUE,
 		      value);
 		break;
+
+	case SN_CMD_ENERGY_DETECT: {
+		/* Packed as the ESP32-C6 packs it: channel in the low byte,
+		 * the window in 16 us symbols above it. This was refused as
+		 * unknown until the survey was ported from Nordic's
+		 * 802154_phy_test, and the nRF README listed "no spectrum
+		 * survey" among this board's limitations.
+		 *
+		 * An 802.15.4 measurement, so refused while BLE is selected,
+		 * for the reason SET_CHANNEL is: the host and the board
+		 * disagreeing about the radio deserves a refusal rather than
+		 * a measurement taken on the wrong one. */
+		if (selected_radio == RADIO_BLE) {
+			reply(command, SN_STATUS_BAD_VALUE, value);
+			break;
+		}
+
+		int8_t dbm = 0;
+		const int err = sn_radio154_energy_detect(
+			(uint8_t)(value & 0xFFu), value >> 8, &dbm);
+
+		if (err == -EINVAL) {
+			reply(command, SN_STATUS_BAD_VALUE, value);
+			break;
+		}
+		if (err != 0) {
+			LOG_WRN("energy detection on %u failed: %d",
+				(unsigned)(value & 0xFFu), err);
+			reply(command, SN_STATUS_FAILED, value);
+			break;
+		}
+		/* Signed, so widened through uint8_t for the host to
+		 * reinterpret -- exactly as the C6 replies. */
+		reply(command, SN_STATUS_OK, (uint32_t)(uint8_t)dbm);
+		break;
+	}
 
 	default:
 		reply(command, SN_STATUS_UNKNOWN_COMMAND, 0u);
