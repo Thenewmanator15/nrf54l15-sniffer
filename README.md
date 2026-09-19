@@ -95,6 +95,17 @@ the one that followed. Replaying every recorded dump, 34 of 34 truncations were
 caught and none delivered; live, 9 of 9, each costing exactly one counted frame.
 The nRF54LM20 has USB of its own, and no bridge at all.
 
+**The bridge also carries leftovers from one session into the next.** When the
+port closes with data in flight, the SAMD11 keeps the whole 64-byte USB packets
+it had queued -- the frame they belong to cut at a packet boundary, a 143-byte
+batch arriving as 128 -- and releases them in front of whatever the board sends
+next. Opening a session, that is the reply to `GET_INFO`, which the stale
+frame's missing tail swallowed: half the opens after a loaded capture, and the
+first after a reflash, timed out with a healthy board. Waiting before asking
+does not help, since the leftovers come out only when the board next transmits.
+The host instead asks again if the first answer has not come within half a
+second, by which time that answer has pushed the leftovers out.
+
 **Per-packet overhead is 22 bytes, and batching only helps when traffic is
 dense.** A packet sent on its own costs a 10-byte frame header and 12 bytes of
 metadata, so a 5-byte acknowledgement travels as 27. Packets that arrive within
