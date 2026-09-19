@@ -211,7 +211,7 @@ The board target needs its SoC and cpucluster qualifiers. A bare
 $env:ZEPHYR_BASE = "C:\path\to\ncs\v3.4.0\zephyr"   # your NCS workspace
 cd $env:ZEPHYR_BASE\..                             # west must run inside it
 west build --no-sysbuild -b xiao_nrf54l15/nrf54l15/cpuapp -d G:\dev\scratch\nrf\bcap <this directory> --pristine -- -DSN_MODE=2
-west flash -d G:\dev\scratch\nrf\bcap --runner openocd
+west flash -d G:\dev\scratch\nrf\bcap --runner openocd --verify
 ```
 
 **`west build` must run inside the west workspace.** `ncsenv.ps1` does not set
@@ -242,6 +242,31 @@ Python helpers do not opt in through their manifests.
 SEGGER probe; this board has a SAMD11 running CMSIS-DAP. `nrfutil` can see the
 board -- `nrfutil device list` names it -- but enumerates it as a serial device
 with no programming trait, and fails with "Unable to find a board".
+
+**On NCS v3.4.0, openocd leaves the end of the image unwritten.** The board's
+`nrf54l-load` turns on the RRAM controller's one-line write buffer (16 bytes)
+and never commits it, so the reset that follows discards the image's last
+partial line -- up to 15 bytes, whatever the previous firmware left there
+stays. The linker puts the tail of `.data` last, so what breaks depends on the
+build. Zephyr's Bluetooth samples lose a buffer pool's pointer and fault in
+`net_buf_alloc_len` at boot. This firmware loses the pointers of the
+networking stack's transmit pool, which a receive-only build never allocates
+from: it runs by luck, not by design. Measured by writing `deadbeef` over the
+line and flashing again: all 12 tail bytes stayed `deadbeef`.
+
+Zephyr fixed it upstream in commit
+[1079b21](https://github.com/zephyrproject-rtos/zephyr/commit/1079b21). On
+v3.4.0, add the same line to `nrf54l-load` in
+`zephyr/boards/seeed/xiao_nrf54l15/support/openocd.cfg`:
+
+    proc nrf54l-load {file} {
+    	mww 0x5004b500 0x101
+    	load_image $file
+    	mww 0x5004b008 1    ;# RRAMC TASKS_COMMITWRITEBUF
+    }
+
+`--verify` resets the board before it compares, so it catches an unpatched
+SDK: the mismatch it reports is the last line of the image.
 
 ## SN_MODE
 
