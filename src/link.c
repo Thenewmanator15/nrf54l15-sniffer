@@ -105,15 +105,23 @@ static void uart_cb_rx(const struct device *dev, struct uart_event *evt, void *u
 	}
 }
 
-/* The SAMD11 bridge overruns during long uninterrupted runs at 1 Mbaud.
- * Measured: 9 bytes lost, twice, both mid-way through the 266-byte
- * conformance frame, and none in a second identical run -- about 90 us of
- * the bridge not draining. Per-byte uart_poll_out never showed it because it
- * left gaps between bytes by accident; EasyDMA streams at exactly line rate
- * and removed them. So each DMA transfer is capped and followed by a short,
- * deliberate gap. At 64 bytes and 20 us that costs about 3% of line rate,
- * against a bridge that otherwise drops a frame every so often. Both are
- * tunables, and both were arrived at by measurement, not taste. */
+/* The SAMD11 bridge holds at most 319 bytes on their way to USB, and when its
+ * USB side pauses -- for milliseconds, below anything the host application
+ * does -- the rest of any continuous burst past 319 bytes is lost. Measured at
+ * full BLE load: 8.7% of frames longer than 319 bytes lost their tails, most
+ * cut at exactly 319 delivered. A rarer fault drops single bytes.
+ *
+ * Each DMA transfer is capped and followed by a short gap. That was chosen
+ * against an earlier, narrower reading of the fault -- 9 bytes lost mid-frame,
+ * taken for about 90 us of the bridge not draining -- and is kept because
+ * nothing measured did better at a price worth paying. Gaps of 500 to 1500 us
+ * cut the overflow by roughly half, and outlasting the pauses outright would
+ * take the link below a saturated 802.15.4 channel. Tune these only against
+ * that measurement: the fault is in how long the bridge stalls, not in how
+ * the bytes are spaced.
+ *
+ * The host's parser detects a frame truncated this way and drops it rather
+ * than splicing the next frame into it; see the README's Limitations. */
 #define TX_DMA_CHUNK  64
 #define TX_DMA_GAP_US 20
 

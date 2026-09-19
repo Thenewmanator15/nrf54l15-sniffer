@@ -67,13 +67,33 @@ ESP32-C6 over real USB. That is the single biggest difference between the two
 boards. 1 Mbaud is the UARTE's ceiling on this part, so it cannot simply be
 raised; the overlay in `boards/` fixes it there and the plugin already matches.
 
-**The bridge drops bytes at that rate, and the fix is a mitigation.** Long
-uninterrupted runs at 1 Mbaud lost 9 bytes mid-frame, twice, and none in an
-identical second run -- about 90 us of the bridge not draining. EasyDMA streams
-at exactly line rate and removed the accidental gaps that per-byte writes used
-to leave, which is what exposed it. Transfers are therefore capped at 64 bytes
-with a deliberate 20 us gap, costing about 3% of line rate. That has held, but
-it is a workaround for a bridge that is not ours, not a guarantee.
+**The bridge drops bytes, and nothing on this side of it can stop that.** The
+SAMD11 holds at most 319 bytes on their way to USB. When its USB side pauses --
+for several milliseconds, and below anything the host application does; a bare
+read loop sees the same -- the rest of any continuous burst past 319 bytes is
+thrown away. Measured with BLE capture at 58 records/s beside an ESP32-C6
+advertising every 30 ms: 14 frames lost their tails in a minute, 10 of them cut
+at exactly 319 bytes delivered, 8.7% of every frame longer than that.
+
+Loss follows how many bursts exceed 319 bytes, not how many packets there are.
+At 30 records/s batches rarely grow that long and one frame was hit in a
+minute; at 24 or fewer, none. A second, rarer fault drops a single byte at a
+random position, about once a minute at full load.
+
+Pacing was measured and not kept. Transfers stay capped at 64 bytes with a
+20 us gap. Gaps of 500 and 1000 us roughly halved the overflow, and 1500 us
+suppressed it for one two-minute run, but the pauses are long enough that
+outlasting them takes the link down to about 30 kB/s -- below a saturated
+802.15.4 channel -- and even that is not a guarantee.
+
+What changed instead is what a loss costs. The header CRC covers only the
+header, so a truncated frame used to decode with the start of the next frame as
+its tail -- 6 of 13 damaged batches in one run were accepted as valid and
+reached Wireshark -- and the frame after it was lost. The host's parser now
+spots a header starting inside a payload, drops the damaged frame and resumes at
+the one that followed. Replaying every recorded dump, 34 of 34 truncations were
+caught and none delivered; live, 9 of 9, each costing exactly one counted frame.
+The nRF54LM20 has USB of its own, and no bridge at all.
 
 **Per-packet overhead is 22 bytes, and batching only helps when traffic is
 dense.** A packet sent on its own costs a 10-byte frame header and 12 bytes of
