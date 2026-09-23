@@ -51,6 +51,17 @@ further ceilings, neither of them configuration:
 - **One periodic sync at a time.** `CONFIG_BT_PER_ADV_SYNC_MAX` defaults to 1
   and `prj.conf` does not raise it, so one is what the SoftDevice Controller
   is built with. Asking for a second produces a refusal and nothing else.
+  A lost sync gives the slot back. Measured on 2026-09-24 against an ESP32-C6
+  advertising an 80 ms train: reset mid-capture, the train stopped, and the
+  board synced to it again about 11 s later with nothing refused — in two
+  runs of two. Without that release it would have followed nothing more for
+  the rest of the capture.
+- **Following a train costs link loss.** It roughly doubles the frame rate,
+  to about 55 records/s, and batches past the bridge's 319 bytes stop being
+  rare (see *The link is a UART* below):
+  in 30 s, 67 frames exceeded it and 7 were cut, each at exactly 319 bytes
+  delivered — 498 bytes lost, 0.4% of what the board sent. The host drops
+  every cut frame whole rather than decoding its remains.
 - **No direction finding.** The SoftDevice Controller offers
   `sdc_support_le_connectionless_cte_transmitter` and no receiving
   counterpart, so AoA and AoD are out whatever antenna is attached.
