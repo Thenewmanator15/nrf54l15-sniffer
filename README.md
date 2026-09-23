@@ -88,6 +88,11 @@ At 30 records/s batches rarely grow that long and one frame was hit in a
 minute; at 24 or fewer, none. A second, rarer fault drops a single byte at a
 random position, about once a minute at full load.
 
+Every figure here can be reproduced with `host/tools/link_probe.py` in
+esp32c6-sniffer (`--port COM4 --seconds 60`). It keeps the raw bytes the host
+read and checks them against the board's own count of what it sent, so the
+loss it reports is exact, and it names each frame that lost its tail.
+
 Pacing was measured and not kept. Transfers stay capped at 64 bytes with a
 20 us gap. Gaps of 500 and 1000 us roughly halved the overflow, and 1500 us
 suppressed it for one two-minute run, but the pauses are long enough that
