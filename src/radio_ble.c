@@ -428,14 +428,21 @@ static void fwd_loop(void *a, void *b, void *c)
 		 * the two reply events by code does not depend on timing.
 		 *
 		 * A capture should contain what the radio heard. Nothing else
-		 * is lost: an advertisement arrives as an LE Meta event. */
-		const enum bt_buf_type kind = bt_buf_get_type(buf);
+		 * is lost: an advertisement arrives as an LE Meta event.
+		 *
+		 * The packet type is the buffer's H:4 prefix, read directly.
+		 * This used bt_buf_get_type(), now deprecated, which pulls the
+		 * same byte but assumes the buffer is OUTGOING: an incoming ISO
+		 * packet came back as BT_BUF_ISO_OUT, the BT_BUF_ISO_IN test
+		 * below could never match, and no broadcast audio reached a
+		 * capture however well the BIG was followed. */
+		const uint8_t h4 = net_buf_pull_u8(buf);
 
-		if (running && kind == BT_BUF_ISO_IN) {
+		if (running && h4 == BT_HCI_H4_ISO) {
 			/* A broadcast isochronous stream: the audio itself,
 			 * rather than the advertisement announcing it. */
 			forward(buf, H4_ISO);
-		} else if (running && kind == BT_BUF_EVT && buf->len > 0u &&
+		} else if (running && h4 == BT_HCI_H4_EVT && buf->len > 0u &&
 			   buf->data[0] != BT_HCI_EVT_CMD_COMPLETE &&
 			   buf->data[0] != BT_HCI_EVT_CMD_STATUS) {
 			forward(buf, H4_EVENT);

@@ -1,7 +1,8 @@
 # nrf54l15-sniffer
 
-Passive IEEE 802.15.4 capture on a Seeed XIAO nRF54L15, streaming into
-Wireshark. **Nothing here transmits.**
+Passive capture on a Seeed XIAO nRF54L15, streaming into Wireshark: IEEE
+802.15.4 (Zigbee, Thread, Matter) and Bluetooth LE advertising, including
+periodic advertising trains. **Nothing here transmits.**
 
 This is firmware only. The Wireshark plugin that reads it lives in
 [esp32c6-sniffer](https://github.com/Thenewmanator15/esp32c6-sniffer) and
@@ -55,10 +56,17 @@ further ceilings, neither of them configuration:
   counterpart, so AoA and AoD are out whatever antenna is attached.
 
 What this board has and the ESP32-C6 does not is LE Audio. A periodic train
-carrying a broadcast also carries BIGInfo, and this firmware joins the
-isochronous group it describes and forwards the audio as ISO packets. The C6's
-silicon has no isochronous channels at all, so it can name a broadcast and
-never hear it.
+carrying a broadcast also carries BIGInfo, and this firmware asks the
+controller to join the isochronous group it describes and forwards the audio
+as ISO packets. The C6's silicon has no isochronous channels at all, so it can
+name a broadcast and never hear it.
+
+**Not yet seen working on air.** Until 2026-09-24 the forwarding dropped every
+ISO packet: it typed each buffer with Zephyr's `bt_buf_get_type()`, since
+deprecated, which assumes a buffer is outgoing, so an incoming ISO packet was
+never recognised as one. That is fixed. Proving it needs a second LE Audio
+broadcaster, and this bench has none: the XIAO is its only part with
+isochronous channels.
 
 **The link is a UART, not USB, and it is the ceiling.** The nRF54L15 has no USB
 device controller, so the host is reached through the board's SAMD11 bridge.
