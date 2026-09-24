@@ -35,6 +35,12 @@ static struct ieee802154_radio_api *api;
 static uint8_t current_channel = 11;
 static uint32_t captured;
 
+/* Frames the radio heard and threw away for a bad FCS. The driver never hands
+ * over their bytes, so they cannot be captured, only counted -- which is still
+ * more than the ESP32-C6 can say. Atomic: the driver reports from its own
+ * interrupt-level context. */
+static atomic_t fcs_failed;
+
 /* Whether a capture has the receiver, so an energy measurement knows what to
  * put back afterwards: receiving, or asleep. */
 static volatile bool running;
@@ -48,6 +54,26 @@ static volatile bool measuring;
 
 /* The largest PSDU an 802.15.4 frame can carry. */
 #define SN_154_MAX_PSDU 127
+
+/* Runs in the driver's context. Counts and returns: extra work on this path
+ * has cost received frames before -- see docs/2026-09-14-nrf54l15-spike.md.
+ * "Not received" is the radio listening to nothing and "address filtered"
+ * cannot happen in promiscuous mode, so neither is counted. A failure while
+ * tuned away to measure energy belongs to another channel, as a frame heard
+ * then does, and is left out for the same reason. */
+static void radio_event(const struct device *dev, enum ieee802154_event evt,
+			void *event_params)
+{
+	ARG_UNUSED(dev);
+	if (evt != IEEE802154_EVENT_RX_FAILED || event_params == NULL ||
+	    !running || measuring) {
+		return;
+	}
+	if (*(const enum ieee802154_rx_fail_reason *)event_params ==
+	    IEEE802154_RX_FAIL_INVALID_FCS) {
+		atomic_inc(&fcs_failed);
+	}
+}
 
 int sn_radio154_init(void)
 {
@@ -70,7 +96,15 @@ int sn_radio154_init(void)
 	/* Promiscuous, or the driver filters to frames addressed to us and a
 	 * sniffer sees almost nothing. */
 	struct ieee802154_config config = { .promiscuous = true };
-	return api->configure(radio, IEEE802154_CONFIG_PROMISCUOUS, &config);
+	int err = api->configure(radio, IEEE802154_CONFIG_PROMISCUOUS, &config);
+
+	if (err != 0) {
+		return err;
+	}
+
+	/* Told about every failed reception; only a bad FCS is counted. */
+	struct ieee802154_config events = { .event_handler = radio_event };
+	return api->configure(radio, IEEE802154_CONFIG_EVENT_HANDLER, &events);
 }
 
 int sn_radio154_set_channel(uint8_t channel)
@@ -188,6 +222,11 @@ uint8_t sn_radio154_channel(void)
 uint32_t sn_radio154_captured(void)
 {
 	return captured;
+}
+
+uint32_t sn_radio154_fcs_failed(void)
+{
+	return (uint32_t)atomic_get(&fcs_failed);
 }
 
 uint32_t sn_radio154_dropped(void)

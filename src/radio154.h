@@ -43,3 +43,5 @@ int sn_radio154_energy_detect(uint8_t channel, uint32_t duration_symbols,
 /* Counters for the STATS frame. */
 uint32_t sn_radio154_captured(void);
 uint32_t sn_radio154_dropped(void);
+/* Frames the radio discarded for a bad FCS: counted, never captured. */
+uint32_t sn_radio154_fcs_failed(void);

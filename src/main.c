@@ -18,7 +18,7 @@
  * refuses to open a capture until the two agree, because an older board packs
  * its metadata differently and every field would then decode to a confident
  * wrong number rather than an error. */
-#define SN_FIRMWARE_VERSION 3u
+#define SN_FIRMWARE_VERSION 4u
 
 LOG_MODULE_REGISTER(sniffer, LOG_LEVEL_INF);
 
@@ -125,6 +125,10 @@ struct sn_stats_full {
 	uint32_t link_rejected;
 	uint32_t wifi[13];
 	struct sn_ble_stats ble;
+	/* Firmware 4. 802.15.4 frames the radio discarded for a bad FCS, which
+	 * the C6 cannot see: appended after every block, because the host reads
+	 * by position and takes a longer frame as a newer one. */
+	uint32_t fcs_failed;
 };
 
 /* The outbound ring's occupancy, unpacked by the host as "<III". Occupancy
@@ -157,6 +161,7 @@ static void stats_tick(struct k_work *work)
 		.isr_queue_full = 0u,
 		.link_rejected = sn_radio154_dropped(),
 		.wifi = {0},
+		.fcs_failed = sn_radio154_fcs_failed(),
 	};
 
 	/* Both radios' counters go in every frame, whichever is running, for
