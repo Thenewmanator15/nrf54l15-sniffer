@@ -49,9 +49,9 @@ static K_MUTEX_DEFINE(encode_lock);
 /* Staging for one encoded frame before it enters the ring. */
 static uint8_t scratch[SN_HEADER_LEN + SN_MAX_PAYLOAD];
 
-/* Host to board. Commands are five bytes, so this only ever needs to hold a
- * frame or two. */
-#define RX_RING_SIZE 512
+/* Host to board. Commands are five bytes, but a device-key frame is up to 194
+ * and one receive buffer can hand over 512 at once (see rx_dma). */
+#define RX_RING_SIZE 1024
 RING_BUF_DECLARE(rx_ring, RX_RING_SIZE);
 
 static sn_frame_handler_t frame_handler;
@@ -91,8 +91,17 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
 	}
 }
 
-/* Double-buffered receive, so the driver always has somewhere to put bytes. */
-static uint8_t rx_dma[2][64];
+/* Double-buffered receive, so the driver always has somewhere to put bytes.
+ *
+ * Each buffer is larger than anything the host sends in one go -- at most
+ * about 280 bytes: a full device-key frame, a full filter and START. A burst
+ * that overflows one buffer into the next can leave its last bytes in the
+ * driver with no frame timeout to hand them over, the nRF54L UARTE erratum
+ * the driver's RX_FRAMETIMEOUT_WORKAROUND is for, and the workaround does not
+ * catch it here. Measured with 64-byte buffers: a 65-byte burst stalled 34
+ * times in 40, released only when the host happened to send more; 15- and
+ * 35-byte bursts never did. */
+static uint8_t rx_dma[2][512];
 static int rx_dma_next;
 
 static void uart_cb_rx(const struct device *dev, struct uart_event *evt, void *user_data)
