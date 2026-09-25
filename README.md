@@ -230,6 +230,19 @@ impossible PHY bitmap started without complaint and delivered nothing --
 measured, 0 advertising reports in 8 s against 243. Now START fails, and the
 log names the command and the controller's status.
 
+And from firmware 5 the board's receive buffers are 512 bytes, not 64.
+Starting a capture with a device key and a filter sends 65 bytes at once, and
+a burst that overflowed one 64-byte buffer into the next could leave its last
+bytes inside the UART driver with no frame timeout to deliver them -- the
+nRF54L UARTE erratum the driver works around, but not in this case. START
+was then not seen until the host sent something else: 34 bursts in 40 at 65
+bytes, never at 15 or 35. With 512-byte buffers, 0 in 40 at 15, 65 and 275
+bytes, the largest the host sends.
+
+Device privacy mode matters on this board. Without it, a keyed device
+advertising under its identity address rather than a private one was not
+heard at all: 0 reports in 65 s, against 54 to 78 with it.
+
 This board does not reset when its serial port opens, so settings survive
 from one capture into the next unless the host sends them again. The host
 now sends the key list and the filter at the start of every capture. The PHY
