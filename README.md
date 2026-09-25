@@ -232,12 +232,13 @@ log names the command and the controller's status.
 
 And from firmware 5 the board's receive buffers are 512 bytes, not 64.
 Starting a capture with a device key and a filter sends 65 bytes at once, and
-a burst that overflowed one 64-byte buffer into the next could leave its last
-bytes inside the UART driver with no frame timeout to deliver them -- the
-nRF54L UARTE erratum the driver works around, but not in this case. START
-was then not seen until the host sent something else: 34 bursts in 40 at 65
-bytes, never at 15 or 35. With 512-byte buffers, 0 in 40 at 15, 65 and 275
-bytes, the largest the host sends.
+a burst longer than one 64-byte buffer could leave its last bytes inside the
+UART driver with no frame timeout to deliver them -- apparently the nRF54L
+UARTE erratum the driver works around, but not in this case. START was then
+not seen until the host sent something else: 34 bursts in 40 at 65 bytes,
+never at 15 or 35. With 512-byte buffers, 0 in 40 at 15, 65 and 275 bytes,
+the largest the host sends. The reassembly buffer behind them went from 256
+to 512 bytes for the same reason.
 
 Device privacy mode matters on this board. Without it, a keyed device
 advertising under its identity address rather than a private one was not
