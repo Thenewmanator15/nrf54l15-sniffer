@@ -940,9 +940,18 @@ int sn_radio_ble_stop(void)
 	k_mutex_unlock(&block);
 
 	const uint8_t disable[6] = {0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u};
+	const int err = send_command(BT_HCI_OP_LE_SET_EXT_SCAN_ENABLE,
+				     disable, sizeof(disable));
 
-	return send_command(BT_HCI_OP_LE_SET_EXT_SCAN_ENABLE,
-			    disable, sizeof(disable));
+	/* And out of the controller. Its resolving list would otherwise keep
+	 * the keys until the next capture's reset, and this board does not
+	 * reset when its port opens. Resolution goes off first: the list
+	 * cannot change while it is on. */
+	const uint8_t off = 0x00u;
+
+	(void)send_command(BT_HCI_OP_LE_SET_ADDR_RES_ENABLE, &off, 1);
+	(void)send_command(BT_HCI_OP_LE_CLEAR_RL, NULL, 0);
+	return err;
 }
 
 void sn_radio_ble_get_stats(struct sn_ble_stats *out)
