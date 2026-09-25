@@ -219,6 +219,15 @@ uint8_t sn_radio154_channel(void)
 	return current_channel;
 }
 
+/* Zeroes the counters, when a host opens a session: this board does not
+ * reboot when its port opens, so otherwise every capture would carry the
+ * last one's counts. */
+void sn_radio154_reset_counters(void)
+{
+	captured = 0u;
+	atomic_set(&fcs_failed, 0);
+}
+
 uint32_t sn_radio154_captured(void)
 {
 	return captured;

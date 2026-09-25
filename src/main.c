@@ -18,7 +18,7 @@
  * refuses to open a capture until the two agree, because an older board packs
  * its metadata differently and every field would then decode to a confident
  * wrong number rather than an error. */
-#define SN_FIRMWARE_VERSION 5u
+#define SN_FIRMWARE_VERSION 6u
 
 LOG_MODULE_REGISTER(sniffer, LOG_LEVEL_INF);
 

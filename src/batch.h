@@ -44,6 +44,7 @@ void sn_batch_add(uint8_t channel, uint64_t timestamp_us, uint8_t lqi,
  * Counted in PACKETS rather than frames, which is the number an operator
  * actually wants: one refused batch is up to 32 packets gone, and reporting
  * it as a single drop would understate the loss thirty-twofold. */
+void sn_batch_reset_counters(void);
 uint32_t sn_batch_dropped(void);
 
 /* Sends whatever is buffered, if anything. Safe to call when empty.

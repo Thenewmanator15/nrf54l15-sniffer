@@ -954,6 +954,22 @@ int sn_radio_ble_stop(void)
 	return err;
 }
 
+/* Zeroes the counters, when a host opens a session: this board does not
+ * reboot when its port opens, so otherwise every capture would carry the
+ * last one's counts. */
+void sn_radio_ble_reset_counters(void)
+{
+	captured = 0u;
+	adv_reports = 0u;
+	forwarded = 0u;
+	oversized = 0u;
+	dropped = 0u;
+	periodic_seen = 0u;
+	periodic_synced = 0u;
+	periodic_reports = 0u;
+	periodic_refused = 0u;
+}
+
 void sn_radio_ble_get_stats(struct sn_ble_stats *out)
 {
 	*out = (struct sn_ble_stats){

@@ -120,3 +120,4 @@ struct sn_ble_stats {
 };
 
 void sn_radio_ble_get_stats(struct sn_ble_stats *out);
+void sn_radio_ble_reset_counters(void);

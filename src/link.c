@@ -113,9 +113,24 @@ static void uart_cb_rx(const struct device *dev, struct uart_event *evt, void *u
 {
 	uart_cb(dev, evt, user_data);
 
-	if (evt->type == UART_RX_BUF_REQUEST) {
+	switch (evt->type) {
+	case UART_RX_BUF_REQUEST:
 		uart_rx_buf_rsp(dev, rx_dma[rx_dma_next], sizeof(rx_dma[0]));
 		rx_dma_next ^= 1;
+		break;
+
+	case UART_RX_DISABLED:
+		/* The driver disables receive after an error -- a framing error
+		 * from a port opened at the wrong rate, say. Left disabled, the
+		 * board went on sending STATS and LINK and ignored every command
+		 * until reflashed. Re-enabling from this event is what the async
+		 * API provides it for. */
+		rx_dma_next = 1;
+		(void)uart_rx_enable(dev, rx_dma[0], sizeof(rx_dma[0]), 1000);
+		break;
+
+	default:
+		break;
 	}
 }
 
@@ -298,6 +313,17 @@ int sn_link_send(sn_frame_type_t type, const uint8_t *payload, size_t len)
 	k_mutex_unlock(&encode_lock);
 	k_sem_give(&tx_ready);
 	return 0;
+}
+
+/* Zeroes the counters, when a host opens a session: this board does not
+ * reboot when its port opens, so otherwise every capture would carry the
+ * last one's counts. */
+void sn_link_reset_counters(void)
+{
+	frames_sent = 0u;
+	bytes_sent = 0u;
+	frames_dropped = 0u;
+	queued_high_water = 0u;
 }
 
 uint32_t sn_link_frames_sent(void)

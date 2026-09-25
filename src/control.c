@@ -23,6 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "batch.h"
 #include "commands.h"
 #include "frame.h"
 #include "link.h"
@@ -208,6 +209,16 @@ void sn_control_handle(uint8_t type, const uint8_t *payload, size_t len)
 		break;
 
 	case SN_CMD_GET_INFO:
+		/* Every capture opens with this, so it starts a fresh session.
+		 * This board does not reboot when its port opens, as the C6 does,
+		 * so without it a second capture carried the first one's counts
+		 * -- 104 frames written up as "509 received" -- and the last
+		 * capture's PHY choice. */
+		sn_link_reset_counters();
+		sn_batch_reset_counters();
+		sn_radio154_reset_counters();
+		sn_radio_ble_reset_counters();
+		ble_phys = 1u;
 		/* The host refuses to open a capture until this matches
 		 * EXPECTED_FIRMWARE_VERSIONS["nrf54l15"], because an older
 		 * board packs its metadata differently and every field would

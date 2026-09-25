@@ -133,6 +133,14 @@ void sn_batch_flush(void)
 	k_mutex_unlock(&lock);
 }
 
+/* Zeroes the counters, when a host opens a session: this board does not
+ * reboot when its port opens, so otherwise every capture would carry the
+ * last one's counts. */
+void sn_batch_reset_counters(void)
+{
+	dropped_packets = 0u;
+}
+
 uint32_t sn_batch_dropped(void)
 {
 	return dropped_packets;

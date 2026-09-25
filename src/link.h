@@ -29,6 +29,7 @@ void sn_link_set_frame_handler(sn_frame_handler_t handler);
 
 /* Counters for the STATS frame. Kept here because this is the only place that
  * knows what actually reached the wire. */
+void sn_link_reset_counters(void);
 uint32_t sn_link_frames_sent(void);
 uint32_t sn_link_bytes_sent(void);
 

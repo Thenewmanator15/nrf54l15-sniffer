@@ -45,3 +45,4 @@ uint32_t sn_radio154_captured(void);
 uint32_t sn_radio154_dropped(void);
 /* Frames the radio discarded for a bad FCS: counted, never captured. */
 uint32_t sn_radio154_fcs_failed(void);
+void sn_radio154_reset_counters(void);
