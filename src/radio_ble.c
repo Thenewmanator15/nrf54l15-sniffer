@@ -73,6 +73,14 @@ static volatile uint8_t pending_status;
 static uint8_t filter[MAX_FILTER][FILTER_ENTRY];
 static uint8_t filter_count;
 
+/* Identity resolving keys: N x (identity type, identity address, key), both
+ * least significant first, exactly as the host frames them. Held for one
+ * capture, cleared when it stops, never logged. */
+#define KEY_ENTRY 23u
+#define MAX_KEYS CONFIG_BT_CTLR_RL_SIZE
+static uint8_t keys[MAX_KEYS][KEY_ENTRY];
+static uint8_t key_count;
+
 /* Periodic advertising. This is the count the SoftDevice Controller is
  * configured for, and it is one: NCS's hci_driver sets
  * SDC_PERIODIC_ADV_SYNC_COUNT from CONFIG_BT_PER_ADV_SYNC_MAX, which defaults
@@ -826,12 +834,82 @@ void sn_radio_ble_set_filter(const uint8_t *payload, size_t len)
 	}
 }
 
+int sn_radio_ble_set_keys(const uint8_t *payload, size_t len)
+{
+	/* Refused whole rather than truncated: a key silently dropped is a
+	 * device silently not followed. */
+	if (len % KEY_ENTRY != 0u || len / KEY_ENTRY > MAX_KEYS) {
+		LOG_WRN("device keys rejected: %u bytes", (unsigned)len);
+		return -EINVAL;
+	}
+	for (size_t i = 0; i < len; i += KEY_ENTRY) {
+		if (payload[i] > 1u) {
+			LOG_WRN("device keys rejected: address type %u",
+				payload[i]);
+			return -EINVAL;
+		}
+	}
+	memset(keys, 0, sizeof(keys));
+	memcpy(keys, payload, len);
+	key_count = (uint8_t)(len / KEY_ENTRY);
+	LOG_INF("device keys: %u", key_count);
+	return 0;
+}
+
+/* Loads the resolving list: resolution off (the list cannot change while it
+ * is on), clear, each key with device privacy mode, then resolution on.
+ * Device privacy mode so a listed device advertising under its identity
+ * address is still heard; the default drops it. The local IRK stays zero:
+ * the sniffer has no identity. */
+static int apply_keys(void)
+{
+	const uint8_t off = 0x00u;
+	const uint8_t on = 0x01u;
+	int err = send_command(BT_HCI_OP_LE_SET_ADDR_RES_ENABLE, &off, 1);
+
+	if (err != 0) {
+		return err;
+	}
+	err = send_command(BT_HCI_OP_LE_CLEAR_RL, NULL, 0);
+	if (err != 0) {
+		return err;
+	}
+	for (uint8_t i = 0; i < key_count; i++) {
+		uint8_t entry[KEY_ENTRY + 16u] = {0};
+
+		memcpy(entry, keys[i], KEY_ENTRY);
+		err = send_command(BT_HCI_OP_LE_ADD_DEV_TO_RL, entry,
+				   sizeof(entry));
+		if (err != 0) {
+			return err;
+		}
+		uint8_t mode[8];
+
+		memcpy(mode, keys[i], 7u);      /* type and identity address */
+		mode[7] = 0x01u;                /* device privacy mode */
+		err = send_command(BT_HCI_OP_LE_SET_PRIVACY_MODE, mode,
+				   sizeof(mode));
+		if (err != 0) {
+			return err;
+		}
+	}
+	return key_count > 0u
+	       ? send_command(BT_HCI_OP_LE_SET_ADDR_RES_ENABLE, &on, 1)
+	       : 0;
+}
+
 /* Loads the accept list into the controller. Rebuilt on every scan start
  * because the reset above clears it. */
 static int apply_filter(void)
 {
-	int err = send_command(BT_HCI_OP_LE_CLEAR_FAL, NULL, 0);
+	/* Keys first: the accept list may name identities that only the
+	 * resolving list can recognise. */
+	int err = apply_keys();
 
+	if (err != 0) {
+		return err;
+	}
+	err = send_command(BT_HCI_OP_LE_CLEAR_FAL, NULL, 0);
 	if (err != 0) {
 		return err;
 	}
@@ -848,6 +926,10 @@ static int apply_filter(void)
 int sn_radio_ble_stop(void)
 {
 	running = false;
+
+	/* Keys are secrets; they live for one capture. */
+	memset(keys, 0, sizeof(keys));
+	key_count = 0u;
 
 	/* Otherwise the last packets before a stop sit in the buffer until
 	 * something else happens to arrive, which on a stopped radio is
