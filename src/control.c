@@ -78,6 +78,12 @@ void sn_control_handle(uint8_t type, const uint8_t *payload, size_t len)
 		sn_radio_ble_set_filter(payload, len);
 		return;
 	}
+	/* Keys ride in a frame for the same reason the filter does, and are
+	 * likewise not answered. radio_ble.c logs a refusal. */
+	if (type == (uint8_t)SN_FRAME_BLE_KEYS) {
+		(void)sn_radio_ble_set_keys(payload, len);
+		return;
+	}
 	if (type != (uint8_t)SN_FRAME_CONTROL_CMD) {
 		return;
 	}

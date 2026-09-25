@@ -11,6 +11,7 @@
 #include <zephyr/bluetooth/buf.h>
 #include <zephyr/bluetooth/hci_raw.h>
 #include <zephyr/bluetooth/hci_types.h>
+#include <zephyr/logging/log.h>
 
 /* For SN_BATCH_LINGER_MS: both radios linger the same, so a capture does
  * not change character when the radio does. */
@@ -53,15 +54,32 @@ static int apply_filter(void);
 static void note_periodic(const uint8_t *hci, uint16_t len);
 static void note_biginfo(const uint8_t *hci, uint16_t len);
 
+LOG_MODULE_REGISTER(radio_ble, LOG_LEVEL_INF);
+
 static K_FIFO_DEFINE(hci_rx);
 static bool running;
 static uint32_t captured;
+
+/* The command in flight and what the controller said about it. One at a
+ * time: the lock serialises the control path against the sync workers. */
+static K_MUTEX_DEFINE(cmd_lock);
+static K_SEM_DEFINE(cmd_done, 0, 1);
+static volatile uint16_t pending_opcode;
+static volatile uint8_t pending_status;
 
 /* Eight is what the host's dialog allows and what the ESP32-C6 stores. */
 #define MAX_FILTER 8
 #define FILTER_ENTRY 7   /* address type, then six bytes of address */
 static uint8_t filter[MAX_FILTER][FILTER_ENTRY];
 static uint8_t filter_count;
+
+/* Identity resolving keys: N x (identity type, identity address, key), both
+ * least significant first, exactly as the host frames them. Held for one
+ * capture, cleared when it stops, never logged. */
+#define KEY_ENTRY 23u
+#define MAX_KEYS CONFIG_BT_CTLR_RL_SIZE
+static uint8_t keys[MAX_KEYS][KEY_ENTRY];
+static uint8_t key_count;
 
 /* Periodic advertising. This is the count the SoftDevice Controller is
  * configured for, and it is one: NCS's hci_driver sets
@@ -154,12 +172,54 @@ static uint64_t now_us(void)
 	return k_ticks_to_us_floor64(k_uptime_ticks());
 }
 
-/* Sends one HCI command and waits for the controller to take it. */
-static int send_command(uint16_t opcode, const uint8_t *params, uint8_t len)
+/* Picks the answer to our own command out of the event stream. Command
+ * Complete puts the opcode at 3 and the status at 5; Command Status puts the
+ * status at 2 and the opcode at 4. */
+static void note_command_result(const uint8_t *evt, uint16_t len)
 {
+	uint16_t opcode;
+	uint8_t status;
+
+	if (evt[0] == BT_HCI_EVT_CMD_COMPLETE && len >= 6u) {
+		opcode = sys_get_le16(evt + 3);
+		status = evt[5];
+	} else if (evt[0] == BT_HCI_EVT_CMD_STATUS && len >= 6u) {
+		status = evt[2];
+		opcode = sys_get_le16(evt + 4);
+	} else {
+		return;
+	}
+	if (opcode == 0u || opcode != pending_opcode) {
+		return;
+	}
+	pending_status = status;
+	pending_opcode = 0u;
+	k_sem_give(&cmd_done);
+}
+
+/* Sends one HCI command and waits for the controller's answer to it:
+ * 0 accepted, -EIO refused (its status in *status if given), -ETIMEDOUT no
+ * answer, or bt_send()'s own error. Does not log a refusal -- for a caller
+ * like the sync worker a refusal is ordinary.
+ *
+ * This used to send, sleep 20 ms and return bt_send()'s result, which says
+ * only that the buffer was queued. A command the controller REFUSED was
+ * never noticed: a scan with an impossible PHY bitmap started "fine" and
+ * captured nothing -- measured, 0 advertising reports in 8 s against 243.
+ * Waiting for the answer also replaces the sleep that kept us inside one
+ * outstanding command.
+ *
+ * Never call this from the forwarding thread: that thread delivers the
+ * answer, so it would wait for itself. */
+static int hci_command(uint16_t opcode, const uint8_t *params, uint8_t len,
+		       uint8_t *status)
+{
+	k_mutex_lock(&cmd_lock, K_FOREVER);
+
 	struct net_buf *buf = bt_buf_get_tx(BT_BUF_CMD, K_SECONDS(1), NULL, 0);
 
 	if (buf == NULL) {
+		k_mutex_unlock(&cmd_lock);
 		return -ENOBUFS;
 	}
 
@@ -173,13 +233,37 @@ static int send_command(uint16_t opcode, const uint8_t *params, uint8_t len)
 		net_buf_add_mem(buf, params, len);
 	}
 
-	const int err = bt_send(buf);
+	k_sem_reset(&cmd_done);
+	pending_status = 0xFFu;
+	pending_opcode = opcode;
 
-	/* Raw mode has no host stack, so nothing is tracking the controller's
-	 * command credit for us. Setup is five commands back to back and this
-	 * is the cheap way to stay inside one outstanding command; it costs
-	 * 100 ms once, at the start of a capture. */
-	k_msleep(20);
+	int err = bt_send(buf);
+
+	if (err == 0 && k_sem_take(&cmd_done, K_SECONDS(2)) != 0) {
+		LOG_ERR("HCI opcode 0x%04x never completed", opcode);
+		err = -ETIMEDOUT;
+	} else if (err == 0 && pending_status != 0u) {
+		err = -EIO;
+	}
+	if (status != NULL) {
+		*status = pending_status;
+	}
+	pending_opcode = 0u;
+	k_mutex_unlock(&cmd_lock);
+	return err;
+}
+
+/* hci_command(), with a refusal logged: during setup every refusal is a
+ * fault somebody needs to see. */
+static int send_command(uint16_t opcode, const uint8_t *params, uint8_t len)
+{
+	uint8_t status = 0u;
+	const int err = hci_command(opcode, params, len, &status);
+
+	if (err == -EIO) {
+		LOG_ERR("HCI opcode 0x%04x refused, status 0x%02x", opcode,
+			status);
+	}
 	return err;
 }
 
@@ -438,6 +522,12 @@ static void fwd_loop(void *a, void *b, void *c)
 		 * capture however well the BIG was followed. */
 		const uint8_t h4 = net_buf_pull_u8(buf);
 
+		/* Our own commands' answers, before the capture filter below
+		 * drops them: send_command() is waiting on one. */
+		if (h4 == BT_HCI_H4_EVT && buf->len >= 2u) {
+			note_command_result(buf->data, buf->len);
+		}
+
 		if (running && h4 == BT_HCI_H4_ISO) {
 			/* A broadcast isochronous stream: the audio itself,
 			 * rather than the advertisement announcing it. */
@@ -613,14 +703,35 @@ static void sync_work_fn(struct k_work *work)
 		params[11] = 0xE8u;
 		params[12] = 0x03u;
 
-		if (send_command(BT_HCI_OP_LE_PER_ADV_CREATE_SYNC,
-				 params, sizeof(params)) == 0) {
+		if (hci_command(BT_HCI_OP_LE_PER_ADV_CREATE_SYNC,
+				params, sizeof(params), NULL) == 0) {
 			sync_count++;
 		}
 		/* A refusal is ordinary rather than an error: the controller
 		 * rejects a duplicate sync to a train it already follows, and
 		 * every repeat of that advertisement queues another request. */
 	}
+}
+
+/* BIG Create Sync, handed to a work item for the reason sync requests are.
+ * note_biginfo() runs on the forwarding thread, which is also the thread
+ * that delivers the controller's answer: waiting for it there would wait
+ * for itself, time out after two seconds, and never join a broadcast. */
+static uint8_t big_params[25 + MAX_BIS];
+static uint8_t big_len;
+static atomic_t big_pending;
+static void big_work_fn(struct k_work *work);
+static K_WORK_DEFINE(big_work, big_work_fn);
+
+static void big_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (hci_command(BT_HCI_OP_LE_BIG_CREATE_SYNC, big_params, big_len,
+			NULL) == 0) {
+		big_synced = true;
+	}
+	atomic_clear(&big_pending);
 }
 
 /* Notices the BIGInfo that a synced periodic train carries, and asks the
@@ -672,9 +783,14 @@ static void note_biginfo(const uint8_t *hci, uint16_t len)
 		params[n++] = i + 1u;           /* BIS indices are 1-based */
 	}
 
-	if (send_command(BT_HCI_OP_LE_BIG_CREATE_SYNC, params, n) == 0) {
-		big_synced = true;
+	/* One request in flight is enough: every BIGInfo repeats until the
+	 * sync is made. */
+	if (!atomic_cas(&big_pending, 0, 1)) {
+		return;
 	}
+	memcpy(big_params, params, n);
+	big_len = n;
+	k_work_submit(&big_work);
 }
 
 /* Notices a periodic train in an extended advertising report and asks for a
@@ -718,12 +834,82 @@ void sn_radio_ble_set_filter(const uint8_t *payload, size_t len)
 	}
 }
 
+int sn_radio_ble_set_keys(const uint8_t *payload, size_t len)
+{
+	/* Refused whole rather than truncated: a key silently dropped is a
+	 * device silently not followed. */
+	if (len % KEY_ENTRY != 0u || len / KEY_ENTRY > MAX_KEYS) {
+		LOG_WRN("device keys rejected: %u bytes", (unsigned)len);
+		return -EINVAL;
+	}
+	for (size_t i = 0; i < len; i += KEY_ENTRY) {
+		if (payload[i] > 1u) {
+			LOG_WRN("device keys rejected: address type %u",
+				payload[i]);
+			return -EINVAL;
+		}
+	}
+	memset(keys, 0, sizeof(keys));
+	memcpy(keys, payload, len);
+	key_count = (uint8_t)(len / KEY_ENTRY);
+	LOG_INF("device keys: %u", key_count);
+	return 0;
+}
+
+/* Loads the resolving list: resolution off (the list cannot change while it
+ * is on), clear, each key with device privacy mode, then resolution on.
+ * Device privacy mode so a listed device advertising under its identity
+ * address is still heard; the default drops it. The local IRK stays zero:
+ * the sniffer has no identity. */
+static int apply_keys(void)
+{
+	const uint8_t off = 0x00u;
+	const uint8_t on = 0x01u;
+	int err = send_command(BT_HCI_OP_LE_SET_ADDR_RES_ENABLE, &off, 1);
+
+	if (err != 0) {
+		return err;
+	}
+	err = send_command(BT_HCI_OP_LE_CLEAR_RL, NULL, 0);
+	if (err != 0) {
+		return err;
+	}
+	for (uint8_t i = 0; i < key_count; i++) {
+		uint8_t entry[KEY_ENTRY + 16u] = {0};
+
+		memcpy(entry, keys[i], KEY_ENTRY);
+		err = send_command(BT_HCI_OP_LE_ADD_DEV_TO_RL, entry,
+				   sizeof(entry));
+		if (err != 0) {
+			return err;
+		}
+		uint8_t mode[8];
+
+		memcpy(mode, keys[i], 7u);      /* type and identity address */
+		mode[7] = 0x01u;                /* device privacy mode */
+		err = send_command(BT_HCI_OP_LE_SET_PRIVACY_MODE, mode,
+				   sizeof(mode));
+		if (err != 0) {
+			return err;
+		}
+	}
+	return key_count > 0u
+	       ? send_command(BT_HCI_OP_LE_SET_ADDR_RES_ENABLE, &on, 1)
+	       : 0;
+}
+
 /* Loads the accept list into the controller. Rebuilt on every scan start
  * because the reset above clears it. */
 static int apply_filter(void)
 {
-	int err = send_command(BT_HCI_OP_LE_CLEAR_FAL, NULL, 0);
+	/* Keys first: the accept list may name identities that only the
+	 * resolving list can recognise. */
+	int err = apply_keys();
 
+	if (err != 0) {
+		return err;
+	}
+	err = send_command(BT_HCI_OP_LE_CLEAR_FAL, NULL, 0);
 	if (err != 0) {
 		return err;
 	}
@@ -741,6 +927,10 @@ int sn_radio_ble_stop(void)
 {
 	running = false;
 
+	/* Keys are secrets; they live for one capture. */
+	memset(keys, 0, sizeof(keys));
+	key_count = 0u;
+
 	/* Otherwise the last packets before a stop sit in the buffer until
 	 * something else happens to arrive, which on a stopped radio is
 	 * never. */
@@ -750,9 +940,18 @@ int sn_radio_ble_stop(void)
 	k_mutex_unlock(&block);
 
 	const uint8_t disable[6] = {0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u};
+	const int err = send_command(BT_HCI_OP_LE_SET_EXT_SCAN_ENABLE,
+				     disable, sizeof(disable));
 
-	return send_command(BT_HCI_OP_LE_SET_EXT_SCAN_ENABLE,
-			    disable, sizeof(disable));
+	/* And out of the controller. Its resolving list would otherwise keep
+	 * the keys until the next capture's reset, and this board does not
+	 * reset when its port opens. Resolution goes off first: the list
+	 * cannot change while it is on. */
+	const uint8_t off = 0x00u;
+
+	(void)send_command(BT_HCI_OP_LE_SET_ADDR_RES_ENABLE, &off, 1);
+	(void)send_command(BT_HCI_OP_LE_CLEAR_RL, NULL, 0);
+	return err;
 }
 
 void sn_radio_ble_get_stats(struct sn_ble_stats *out)

@@ -74,6 +74,12 @@ int sn_radio_ble_stop(void);
  * the controller is reset at that point and forgets it. */
 void sn_radio_ble_set_filter(const uint8_t *payload, size_t len);
 
+/* Identity resolving keys: N x 23 bytes, (identity type, identity address,
+ * key), the last two least significant first. Refused whole if malformed or
+ * more than CONFIG_BT_CTLR_RL_SIZE. Loaded at the next scan start, before
+ * the accept list; cleared when the scan stops. */
+int sn_radio_ble_set_keys(const uint8_t *payload, size_t len);
+
 /* Follows periodic advertising trains as they are noticed.
  *
  * An extended advertisement carries the interval of its periodic train, if it

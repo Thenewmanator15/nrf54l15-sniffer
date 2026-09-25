@@ -213,6 +213,43 @@ wrong.
 promiscuous receive. That is a design constraint, not an omission -- there is
 no active scan, no injection and no association.
 
+## Device keys
+
+From firmware 5 this board accepts identity resolving keys
+(`SN_FRAME_BLE_KEYS`, frame type 15). At each scan start it loads them into
+the controller's resolving list, each with device privacy mode, just before
+the accept list, so a device that changes its address is reported and
+filtered under its fixed identity address. It holds eight
+(`CONFIG_BT_CTLR_RL_SIZE`). How to use this from Wireshark is in
+esp32c6-sniffer's README,
+[Following a device that changes its address](https://github.com/Thenewmanator15/esp32c6-sniffer#following-a-device-that-changes-its-address).
+
+Also from firmware 5, every HCI command waits for the controller's answer.
+Before, a command the controller refused went unnoticed: a scan with an
+impossible PHY bitmap started without complaint and delivered nothing --
+measured, 0 advertising reports in 8 s against 243. Now START fails, and the
+log names the command and the controller's status.
+
+And from firmware 5 the board's receive buffers are 512 bytes, not 64.
+Starting a capture with a device key and a filter sends 65 bytes at once, and
+a burst longer than one 64-byte buffer could leave its last bytes inside the
+UART driver with no frame timeout to deliver them -- apparently the nRF54L
+UARTE erratum the driver works around, but not in this case. START was then
+not seen until the host sent something else: 34 bursts in 40 at 65 bytes,
+never at 15 or 35. With 512-byte buffers, 0 in 40 at 15, 65 and 275 bytes,
+the largest the host sends. The reassembly buffer behind them went from 256
+to 512 bytes for the same reason.
+
+Device privacy mode matters on this board. Without it, a keyed device
+advertising under its identity address rather than a private one was not
+heard at all: 0 reports in 65 s, against 54 to 78 with it.
+
+This board does not reset when its serial port opens, so settings survive
+from one capture into the next unless the host sends them again. The host
+now sends the key list and the filter at the start of every capture. The PHY
+setting still carries over: a capture that does not choose one gets the last
+one used.
+
 ## Toolchain
 
 nRF Connect SDK **v3.4.0** (Zephyr 4.4.0, west 1.5.0), installed with
