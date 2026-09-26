@@ -805,15 +805,23 @@ static void note_periodic(const uint8_t *hci, uint16_t len)
 	if ((hci[19] | ((uint16_t)hci[20] << 8)) == 0u) {
 		return;
 	}
+	/* Anonymous: no address to sync to. */
+	if (hci[7] == 0xFFu) {
+		return;
+	}
 
 	/* Counted per announcement rather than per advertiser: the same train
 	 * is announced repeatedly, and the figure is here to show the
 	 * detection path ran at all. */
 	periodic_seen++;
 
+	/* The report's address type can be 0x02 or 0x03, an identity the
+	 * resolving list resolved, and Create Sync takes only 0x00 or 0x01 --
+	 * public or random, "or identity" -- so it refused every train a device
+	 * key had resolved. */
 	struct sync_req req = {
 		.sid = hci[16],
-		.addr_type = hci[7],
+		.addr_type = hci[7] & 0x01u,
 	};
 
 	memcpy(req.addr, hci + 8, sizeof(req.addr));
