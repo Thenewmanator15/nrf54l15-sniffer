@@ -378,5 +378,8 @@ uint32_t sn_link_high_water(void)
 
 uint32_t sn_link_capacity(void)
 {
-	return TX_RING_SIZE;
+	/* The space capture data can use. The reserve is kept for control
+	 * frames, so reporting the whole ring made a saturated one read as 94%
+	 * full. Control frames can still take the queue past this, briefly. */
+	return TX_RING_SIZE - TX_CONTROL_RESERVE;
 }
