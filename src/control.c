@@ -267,6 +267,11 @@ void sn_control_handle(uint8_t type, const uint8_t *payload, size_t len)
 		 * syncs with it, into this one. */
 		(void)stop_radio(RADIO_154);
 		(void)stop_radio(RADIO_BLE);
+		/* And 802.15.4 selected, as the C6 is after its reboot. BLE stayed
+		 * selected after a BLE capture, so a tool that did not select a
+		 * radio -- survey.py -- had every channel and energy command
+		 * refused, and reported a channel with a network on it as quiet. */
+		selected_radio = RADIO_154;
 		sn_link_reset_counters();
 		sn_batch_reset_counters();
 		sn_radio154_reset_counters();
