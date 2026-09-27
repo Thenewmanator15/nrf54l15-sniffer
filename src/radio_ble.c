@@ -59,6 +59,11 @@ LOG_MODULE_REGISTER(radio_ble, LOG_LEVEL_INF);
 static K_FIFO_DEFINE(hci_rx);
 static bool running;
 static uint32_t captured;
+/* Whether the controller came up at boot. If it did not, the firmware
+ * carries on with 802.15.4 only, and nothing is there to answer a command:
+ * each one waited two seconds to time out, so every session open, which
+ * resets the controller, stalled on it. */
+static bool ready;
 
 /* The command in flight and what the controller said about it. One at a
  * time: the lock serialises the control path against the sync workers. */
@@ -472,8 +477,12 @@ static void note_counts(const uint8_t *evt, uint16_t len)
 		 * Max_PDU (2), ISO_Interval (2), Num_BIS, then a handle per
 		 * stream. big_synced went up when the command was accepted;
 		 * a failure here has to bring it down, or no broadcast would
-		 * be joined again until the next START. */
+		 * be joined again until the next START. A success sets it too:
+		 * a Create Sync whose answer timed out may still have been
+		 * accepted, and without this every 5 s another was sent and
+		 * refused for as long as the broadcast lasted. */
 		if (len >= 17u && evt[3] == BT_HCI_ERR_SUCCESS) {
+			big_synced = true;
 			note_big_established(evt + 16, len - 16u);
 		} else {
 			big_synced = false;
@@ -645,7 +654,13 @@ int sn_radio_ble_init(void)
 			fwd_loop, NULL, NULL, NULL,
 			FWD_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(&fwd_thread, "ble_fwd");
+	ready = true;
 	return 0;
+}
+
+bool sn_radio_ble_ready(void)
+{
+	return ready;
 }
 
 /* The state a scan starts from, once the controller has taken it. */
@@ -657,6 +672,9 @@ static void scan_started(void)
 	sync_count = 0u;
 	big_synced = false;
 	big_retry_at = 0;
+	/* A data-path setup still queued from the last capture would
+	 * otherwise be sent for its streams into this one. */
+	bis_count = 0u;
 	k_msgq_purge(&sync_q);
 
 	/* Set last: everything before it is configuration, and forwarding it
@@ -693,6 +711,9 @@ static int start_legacy_scan(uint16_t interval, uint16_t window)
 
 int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys)
 {
+	if (!ready) {
+		return -ENODEV;
+	}
 	/* Defaulted and clamped rather than rejected, because the ESP32-C6
 	 * firmware does exactly this and two boards disagreeing about what an
 	 * odd request means would be worse than either answer. A window equal

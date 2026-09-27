@@ -62,6 +62,10 @@ int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys);
  * resolving list -- by resetting the controller. Safe when not scanning. */
 int sn_radio_ble_stop(void);
 
+/* Whether the controller came up at boot. When it did not, the board is
+ * 802.15.4 only, and a BLE command would only wait to time out. */
+bool sn_radio_ble_ready(void);
+
 /* The PHY choice that means legacy scanning: legacy advertisements only,
  * through the legacy commands. shared/commands.h documents it as 0. */
 #define SN_BLE_PHYS_LEGACY 0u
