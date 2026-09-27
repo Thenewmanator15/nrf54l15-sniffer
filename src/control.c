@@ -84,13 +84,16 @@ static int set_antenna(uint32_t value)
 }
 
 /* Stops a radio, 802.15.4 with its open batch sent first, so the host sees
- * every packet before the reply that says capture has stopped. BLE always
- * resets the controller, scanning or not: a START that failed part-way has
- * already loaded keys and a filter. */
+ * every packet before the reply that says capture has stopped. BLE resets
+ * the controller whether it was scanning or not -- a START that failed
+ * part-way has already loaded keys and a filter -- provided it came up at
+ * all. */
 static int stop_radio(uint8_t radio)
 {
 	if (radio == RADIO_BLE) {
-		return sn_radio_ble_stop();
+		/* Not when the controller never came up: nothing would answer
+		 * the reset, and GET_INFO would wait on it every session. */
+		return sn_radio_ble_ready() ? sn_radio_ble_stop() : 0;
 	}
 	const int err = sn_radio154_stop();
 

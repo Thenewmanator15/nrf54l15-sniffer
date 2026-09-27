@@ -87,10 +87,12 @@ set up for each stream, and none was, so even a group joined perfectly put no
 audio in a capture. Firmware 7 sets one up as each join completes, as Zephyr's
 own `iso_receive` sample does; builds the controller for two streams, where it
 held one and refused every stereo broadcast; skips encrypted broadcasts rather
-than asking to join them on every event; and tries a refused or lost join
-again after 5 s, where it once never tried again. Proving any of it needs a
-second LE Audio broadcaster, and this bench has none: the XIAO is its only
-part with isochronous channels.
+than asking to join them on every event; tries a refused join, or one that
+was accepted and then failed to establish, again after 5 s; and rejoins a
+lost broadcast at its next announcement, where before it never joined another
+until the next capture. Proving any of it needs a second LE Audio
+broadcaster, and this bench has none: the XIAO is its only part with
+isochronous channels.
 
 **The link is a UART, not USB, and it is the ceiling.** The nRF54L15 has no USB
 device controller, so the host is reached through the board's SAMD11 bridge.
