@@ -267,6 +267,14 @@ int net_recv_data(struct net_if *iface, struct net_pkt *pkt)
 		net_pkt_unref(pkt);
 		return 0;
 	}
+	if (!running) {
+		/* Queued by the driver as it stopped, and delivered after. Batched,
+		 * these reached the host about 20 ms after the STOP or GET_INFO
+		 * reply -- packets from a capture that had already ended. Not
+		 * counted as lost: nobody was capturing any more. */
+		net_pkt_unref(pkt);
+		return 0;
+	}
 
 	const uint8_t *psdu = net_buf_frag_last(pkt->buffer)->data;
 	size_t length = net_buf_frags_len(pkt->buffer);
