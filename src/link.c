@@ -42,6 +42,19 @@ static uint32_t queued_high_water;
  * it dropped some. */
 #define TX_RING_SIZE 8192
 RING_BUF_DECLARE(tx_ring, TX_RING_SIZE);
+
+/* Room that capture data and logs leave free, for the frames that carry
+ * control: replies, STATS, LINK. They competed for the same ring, and a reply
+ * refused for want of space was simply lost -- the host waited for it and gave
+ * up, which ended a capture or failed a retune or a Check keys. A STATS frame
+ * is the largest of them, at 142 bytes. */
+#define TX_CONTROL_RESERVE 512u
+
+static bool carries_control(sn_frame_type_t type)
+{
+	return type == SN_FRAME_CONTROL_REPLY || type == SN_FRAME_STATS ||
+	       type == SN_FRAME_LINK || type == SN_FRAME_HEARTBEAT;
+}
 static K_SEM_DEFINE(tx_ready, 0, 1);
 static K_SEM_DEFINE(tx_done, 1, 1);
 static K_MUTEX_DEFINE(encode_lock);
@@ -262,7 +275,13 @@ static void reader(void *a, void *b, void *c)
 	}
 }
 
-K_THREAD_DEFINE(sn_link_reader, 1024, reader, NULL, NULL, NULL, 7, 0, 0);
+/* 1536, not 1024. Commands run on this thread, and a BLE START sends a dozen
+ * HCI commands down through the SoftDevice Controller -- measured from the
+ * disassembly at about 750 bytes deep, before three calls that could not be
+ * followed -- and GET_INFO now resets the controller too. NCS sizes the thread
+ * that calls into the controller at 1536; an overflow here faults the reader,
+ * and the board then ignores every command while STATS keep flowing. */
+K_THREAD_DEFINE(sn_link_reader, 1536, reader, NULL, NULL, NULL, 7, 0, 0);
 
 int sn_link_init(void)
 {
@@ -291,7 +310,9 @@ int sn_link_send(sn_frame_type_t type, const uint8_t *payload, size_t len)
 	/* All or nothing. Half a frame in the ring would be indistinguishable
 	 * from a corrupted one at the host, and would cost it a resync for no
 	 * reason; a frame refused outright is counted and reported instead. */
-	if (ring_buf_space_get(&tx_ring) < n) {
+	const size_t reserve = carries_control(type) ? 0u : TX_CONTROL_RESERVE;
+
+	if (ring_buf_space_get(&tx_ring) < n + reserve) {
 		frames_dropped++;
 		k_mutex_unlock(&encode_lock);
 		return -ENOMEM;

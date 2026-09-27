@@ -133,6 +133,11 @@ int sn_radio154_start(void)
 
 int sn_radio154_stop(void)
 {
+	/* Safe to call stopped: a new session stops both radios whatever
+	 * the last one left running. */
+	if (!running) {
+		return 0;
+	}
 	const int err = api->stop(radio);
 
 	if (err == 0) {
@@ -284,9 +289,12 @@ int net_recv_data(struct net_if *iface, struct net_pkt *pkt)
 	 * link needs on a channel carrying small frames back to back.
 	 *
 	 * There is no flags field in a batch entry. SN_154_FLAG_HAS_FCS was
-	 * the only flag and it was always clear here, because the driver
-	 * strips the checksum before this code sees a frame. Carrying a byte
-	 * that is always zero would have cost more than the flag was worth. */
+	 * the only flag and it is always clear here, because the driver
+	 * strips the checksum before this code sees a frame -- since
+	 * CONFIG_IEEE802154_L2_PKT_INCL_FCS=n in prj.conf. Before that this
+	 * comment was wrong, and every frame carried two bytes too many; see
+	 * the note there. Carrying a byte that is always zero would have cost
+	 * more than the flag was worth. */
 	captured++;
 	sn_batch_add(current_channel, timestamp_us,
 		     net_pkt_ieee802154_lqi(pkt),
