@@ -43,6 +43,12 @@ out.
 advertisements. Wi-Fi does not exist on this part and is *refused* when the
 host asks for it, rather than accepted and quietly ignored.
 
+**Extended scanning, or legacy.** The default scans with the extended
+commands, which report legacy advertisements too. "Legacy only" scans with the
+legacy ones, for measuring what extended scanning adds: from firmware 7, 287
+legacy reports and no extended ones in 10 s. Earlier firmware refused it, and
+the capture failed to open.
+
 **BLE here is a scanner, not a link-layer sniffer.** Advertisements, scan
 responses, and the periodic trains that carry Auracast; never a connection,
 which needs link-layer access the controller does not expose over HCI. Two
@@ -75,9 +81,16 @@ name a broadcast and never hear it.
 **Not yet seen working on air.** Until 2026-09-24 the forwarding dropped every
 ISO packet: it typed each buffer with Zephyr's `bt_buf_get_type()`, since
 deprecated, which assumes a buffer is outgoing, so an incoming ISO packet was
-never recognised as one. That is fixed. Proving it needs a second LE Audio
-broadcaster, and this bench has none: the XIAO is its only part with
-isochronous channels.
+never recognised as one. That is fixed. So is a second fault, from firmware 7:
+the controller routes a broadcast's audio over HCI only through a data path
+set up for each stream, and none was, so even a group joined perfectly put no
+audio in a capture. Firmware 7 sets one up as each join completes, as Zephyr's
+own `iso_receive` sample does; builds the controller for two streams, where it
+held one and refused every stereo broadcast; skips encrypted broadcasts rather
+than asking to join them on every event; and tries a refused or lost join
+again after 5 s, where it once never tried again. Proving any of it needs a
+second LE Audio broadcaster, and this bench has none: the XIAO is its only
+part with isochronous channels.
 
 **The link is a UART, not USB, and it is the ceiling.** The nRF54L15 has no USB
 device controller, so the host is reached through the board's SAMD11 bridge.
@@ -149,10 +162,22 @@ strips the FCS before this firmware sees anything, so a capture cannot show
 malformed or corrupted frames -- only that a gap exists where one might have
 been. PSDUs are capped at 127 bytes, which is the standard's own limit.
 
-**The onboard antenna only.** The board has an RF switch, but which position
-selects which antenna is not established and the gain difference has not been
-measured, so asking for the external antenna is refused rather than accepted
-and ignored.
+Before firmware 7 it validated the FCS and did **not** strip it: raw mode
+defaults `CONFIG_IEEE802154_L2_PKT_INCL_FCS` on, so every frame reached the
+capture two bytes long. Wireshark read them as part of the MIC and no secured
+frame decrypted -- 0 MLE commands from a Thread network in 60 s, against 17 on
+firmware 7, with every acknowledgement 33 bytes rather than 31. `prj.conf`
+turns it off. An older capture is recovered with
+`editcap -L -C -2 in.pcapng out.pcapng`.
+
+**Both antennas, from firmware 7.** The board's RF switch is a
+`regulator-fixed` node, `rfsw_ctl` on gpio2.5: low selects the onboard
+ceramic antenna, which is how it boots, and high the IPEX connector, as
+Seeed's getting-started guide sets them. Firmware 6 and earlier refused the
+external antenna, and the host offered it, so choosing it failed the capture.
+Measured with an antenna fitted, alternating the two over 8 advertisers: the
+external read a median 14.5 dB weaker, -8 to -17 -- the opposite of the
+ESP32-C6's +13 dB, so that antenna or its seating is worth a look.
 
 **No snaplen, no hardware filter, no trace.** The wire format carries commands
 for all of these and the ESP32-C6 implements them; here they return
@@ -178,10 +203,11 @@ because this link cannot detect them: reporting anything else would invent a
 measurement, and a zero meaning "none" is indistinguishable from a zero meaning
 "cannot tell".
 
-The same applies to three of the eleven BLE counters. There is no intermediate
-receive queue here to overflow, and `send_command` does not wait for the
-controller to answer, so queue-full and command-timeout figures go out as
-zeros that mean "cannot tell" rather than "none". The header says which.
+The same applies to one of the eleven BLE counters. There is no intermediate
+receive queue here to overflow, so queue-full goes out as a zero that means
+"cannot tell" rather than "none". Commands have waited for the controller's
+answer since firmware 5, and from firmware 7 one it never answers is counted
+as a command timeout. The header says which is which.
 
 **Timestamp accuracy is uncharacterised.** Timestamps come from the driver's
 own packet timestamp at microsecond resolution. The ~0.5 us figure measured on
@@ -245,10 +271,15 @@ advertising under its identity address rather than a private one was not
 heard at all: 0 reports in 65 s, against 54 to 78 with it.
 
 This board does not reset when its serial port opens, so settings survive
-from one capture into the next unless the host sends them again. The host
-now sends the key list and the filter at the start of every capture. The PHY
-setting still carries over: a capture that does not choose one gets the last
-one used.
+from one capture into the next unless something puts them back. From
+firmware 7 a new capture does: GET_INFO stops both radios -- one left running
+by a capture that was killed rather than stopped -- and returns every BLE
+setting and the antenna to its default. Periodic following carried over
+before that: with firmware 6, a capture that never asked for it followed a
+train anyway, 97 announcements seen and 145 reports in 15 s; with firmware 7,
+none. The host also sends every setting at the start of each capture now.
+And a BLE STOP resets the controller, because periodic and BIG syncs do not
+depend on scanning and otherwise ran on into the next capture.
 
 ## Toolchain
 
