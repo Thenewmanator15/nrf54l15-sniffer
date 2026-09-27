@@ -17,8 +17,14 @@
  * EXPECTED_FIRMWARE_VERSIONS in host/src/esp32c6_sniffer/capture.py; the host
  * refuses to open a capture until the two agree, because an older board packs
  * its metadata differently and every field would then decode to a confident
- * wrong number rather than an error. */
-#define SN_FIRMWARE_VERSION 6u
+ * wrong number rather than an error.
+ *
+ * 7: 802.15.4 frames arrive without the two FCS bytes that 6 and earlier
+ * left on the end of every one, which kept any secured frame from
+ * decrypting; and "Legacy only" and the external antenna work. A host
+ * reading 6 would present frames that never decrypt as though they were
+ * fine, so it is told to reflash instead. */
+#define SN_FIRMWARE_VERSION 7u
 
 LOG_MODULE_REGISTER(sniffer, LOG_LEVEL_INF);
 
