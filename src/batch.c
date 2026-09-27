@@ -18,11 +18,18 @@
 #define HEADER_LEN  10   /* u64 base timestamp, u8 channel, u8 count */
 #define ENTRY_LEN   5    /* u16 dt, u8 lqi, i8 rssi, u8 len */
 
+/* Closes a batch by size as well as by count, as the BLE batcher does and at
+ * its figure. Thirty-two near-full frames made a batch of up to 4234 bytes,
+ * past the 4096 a frame can carry, and sn_link_send refused it whole: every
+ * packet in it counted as lost, with room to spare in the ring. Trains of
+ * broadcast 6LoWPAN fragments are exactly that shape. */
+#define MAX_BATCH_BYTES 2048
+
 /* Static, and deliberately so: this is filled from the radio driver's RX
  * thread, whose stack overflowing is the fault that cost days and that
- * docs/2026-09-14-nrf54l15-spike.md exists to document. 4234 bytes against
- * 256 KB of RAM is a trade worth making without thinking about it twice. */
-static uint8_t buf[HEADER_LEN + MAX_ENTRIES * (ENTRY_LEN + MAX_PSDU)];
+ * docs/2026-09-14-nrf54l15-spike.md exists to document. Sized by the byte
+ * limit, which one entry of at most 132 bytes always fits under. */
+static uint8_t buf[MAX_BATCH_BYTES];
 static size_t used = HEADER_LEN;   /* header written at flush, not at open */
 static uint8_t count;
 static uint64_t base_us;
@@ -155,8 +162,10 @@ void sn_batch_add(uint8_t channel, uint64_t timestamp_us, uint8_t lqi,
 
 	k_mutex_lock(&lock, K_FOREVER);
 
-	/* Three things close a batch early, and all three are conditions the
-	 * host would reject the frame for rather than tolerate.
+	/* Four things close a batch early: a new channel, a delta that will
+	 * not fit or runs backwards, and a batch that would outgrow
+	 * MAX_BATCH_BYTES. Each is a frame the host or the link would refuse
+	 * rather than tolerate.
 	 *
 	 * A timestamp going backwards is the odd one. It should not happen --
 	 * the clock is monotonic -- but if it ever did, a negative delta would
@@ -166,7 +175,8 @@ void sn_batch_add(uint8_t channel, uint64_t timestamp_us, uint8_t lqi,
 	if (count > 0u &&
 	    (channel != batch_channel ||
 	     timestamp_us < last_us ||
-	     timestamp_us - last_us > MAX_DT_US)) {
+	     timestamp_us - last_us > MAX_DT_US ||
+	     used + ENTRY_LEN + len > MAX_BATCH_BYTES)) {
 		flush_locked();
 	}
 
