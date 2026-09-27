@@ -93,9 +93,28 @@ static bool periodic_enabled;
 static uint8_t sync_count;
 
 /* One broadcast group at a time. A second would need its own BIG handle and
- * its own set of stream indices, and nothing here has asked for two. */
-#define MAX_BIS 4
+ * its own set of stream indices, and nothing here has asked for two.
+ *
+ * Streams, up to what the controller was built to hold: NCS's hci_driver
+ * gives the SoftDevice Controller CONFIG_BT_CTLR_SYNC_ISO_STREAM_COUNT BIS
+ * sinks, which follows CONFIG_BT_ISO_MAX_CHAN in prj.conf. (STREAM_MAX is
+ * Zephyr's own link layer's, and unused here.) This was 4 against a
+ * controller built for one, and asking for more streams than it holds is
+ * refused outright, so every stereo broadcast was refused. */
+#define MAX_BIS CONFIG_BT_CTLR_SYNC_ISO_STREAM_COUNT
 static bool big_synced;
+/* When a join that was refused, or accepted and then failed, may be tried
+ * again. Every BIGInfo -- every event of the train -- asked again at once,
+ * holding the command lock each time. */
+static int64_t big_retry_at;
+#define BIG_RETRY_MS 5000
+
+/* The streams of the group joined, which the controller delivers over HCI
+ * only once a data path is set up for each. */
+static uint16_t bis_handles[MAX_BIS];
+static uint8_t bis_count;
+static void iso_path_work_fn(struct k_work *work);
+static K_WORK_DEFINE(iso_path_work, iso_path_work_fn);
 
 struct sync_req {
 	uint8_t sid;
@@ -123,6 +142,7 @@ static uint32_t periodic_seen;
 static uint32_t periodic_synced;
 static uint32_t periodic_reports;
 static uint32_t periodic_refused;
+static uint32_t command_timeouts;
 
 /* The forwarding thread. Its own stack rather than the system work queue's:
  * an extended advertising report is up to 300 bytes and is copied here, and
@@ -168,8 +188,12 @@ static uint64_t now_us(void)
 {
 	/* Arrival at this firmware, not at the antenna: the controller does
 	 * not expose a radio timestamp over HCI. Honest about being that,
-	 * exactly as the C6's esp_timer reading is. */
-	return k_ticks_to_us_floor64(k_uptime_ticks());
+	 * exactly as the C6's esp_timer reading is.
+	 *
+	 * The cycle counter, not the uptime ticks. Both read the same 64-bit
+	 * GRTC, but the ticks run at 31,250 Hz, so every timestamp was a
+	 * multiple of 32 us; the cycles are 1 MHz, and cost no more. */
+	return k_cyc_to_us_floor64(k_cycle_get_64());
 }
 
 /* Picks the answer to our own command out of the event stream. Command
@@ -239,10 +263,17 @@ static int hci_command(uint16_t opcode, const uint8_t *params, uint8_t len,
 
 	int err = bt_send(buf);
 
-	if (err == 0 && k_sem_take(&cmd_done, K_SECONDS(2)) != 0) {
+	if (err != 0) {
+		/* On failure the buffer is still ours (drivers/bluetooth.h), and
+		 * it is the only command buffer there is: kept, every later
+		 * command waited a second for it and failed, and BLE was dead
+		 * until a reboot -- STOP included. */
+		net_buf_unref(buf);
+	} else if (k_sem_take(&cmd_done, K_SECONDS(2)) != 0) {
 		LOG_ERR("HCI opcode 0x%04x never completed", opcode);
+		command_timeouts++;
 		err = -ETIMEDOUT;
-	} else if (err == 0 && pending_status != 0u) {
+	} else if (pending_status != 0u) {
 		err = -EIO;
 	}
 	if (status != NULL) {
@@ -340,6 +371,48 @@ static void ble_linger_expired(struct k_work *work)
 	k_mutex_unlock(&block);
 }
 
+/* A BIG joined: Num_BIS, then a two-byte handle per stream. Setting up their
+ * data paths is a command, so it goes to a work item -- this runs on the
+ * forwarding thread, which delivers the answer. */
+static void note_big_established(const uint8_t *at, uint16_t len)
+{
+	const uint8_t n = at[0];
+	uint8_t kept = 0u;
+
+	for (uint8_t i = 0; i < n && kept < MAX_BIS &&
+			    1u + 2u * (i + 1u) <= len; i++) {
+		bis_handles[kept++] = sys_get_le16(at + 1u + 2u * i);
+	}
+	bis_count = kept;
+	k_work_submit(&iso_path_work);
+}
+
+/* LE Setup ISO Data Path, controller to host over HCI, for each stream.
+ *
+ * Without it the controller follows the broadcast and hands over nothing:
+ * isochronous data reaches HCI only through a data path set up for it, and
+ * this was never sent -- so a BIG joined perfectly put no audio in the
+ * capture. Zephyr's own iso_receive sample sets one up the moment a stream
+ * connects; this is the same command, with no codec in the controller
+ * (transparent) so the frames arrive as they went over the air. */
+static void iso_path_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	for (uint8_t i = 0; i < bis_count && running; i++) {
+		uint8_t params[13] = {0};
+
+		sys_put_le16(bis_handles[i], params);
+		params[2] = BT_HCI_DATAPATH_DIR_CTLR_TO_HOST;
+		params[3] = 0x00u;                          /* HCI */
+		params[4] = BT_HCI_CODING_FORMAT_TRANSPARENT;
+		/* company, vendor codec, controller delay, config length:
+		 * all zero. */
+		(void)send_command(BT_HCI_OP_LE_SETUP_ISO_PATH, params,
+				   sizeof(params));
+	}
+}
+
 /* Counts what an event was, for the STATS frame.
  *
  * Read straight off the event rather than the H4-shimmed copy note_periodic
@@ -394,6 +467,23 @@ static void note_counts(const uint8_t *evt, uint16_t len)
 			sync_count--;
 		}
 		break;
+	case BT_HCI_EVT_LE_BIG_SYNC_ESTABLISHED:
+		/* Status, BIG handle, latency (3), NSE, BN, PTO, IRC,
+		 * Max_PDU (2), ISO_Interval (2), Num_BIS, then a handle per
+		 * stream. big_synced went up when the command was accepted;
+		 * a failure here has to bring it down, or no broadcast would
+		 * be joined again until the next START. */
+		if (len >= 17u && evt[3] == BT_HCI_ERR_SUCCESS) {
+			note_big_established(evt + 16, len - 16u);
+		} else {
+			big_synced = false;
+			big_retry_at = k_uptime_get() + BIG_RETRY_MS;
+		}
+		break;
+	case BT_HCI_EVT_LE_BIG_SYNC_LOST:
+		/* The broadcast went away. Free to join the next one. */
+		big_synced = false;
+		break;
 	default:
 		break;
 	}
@@ -424,8 +514,9 @@ static void forward(struct net_buf *buf, uint8_t h4_type)
 	}
 
 	/* Before batching, because this reads the event rather than the copy,
-	 * and because a train noticed late is a train not followed. */
-	if (periodic_enabled) {
+	 * and because a train noticed late is a train not followed. Events
+	 * only: an ISO packet dressed as one was read for a train too. */
+	if (periodic_enabled && h4_type == H4_EVENT) {
 		/* The H4 byte is not in the buffer, so a one-byte shim keeps
 		 * the offsets the same as everywhere else that reads an HCI
 		 * packet. */
@@ -557,15 +648,51 @@ int sn_radio_ble_init(void)
 	return 0;
 }
 
+/* The state a scan starts from, once the controller has taken it. */
+static void scan_started(void)
+{
+	/* A fresh scan is a fresh controller: the reset dropped any syncs it
+	 * held, so the counts have to follow it down or no new train or
+	 * broadcast would ever be followed. */
+	sync_count = 0u;
+	big_synced = false;
+	big_retry_at = 0;
+	k_msgq_purge(&sync_q);
+
+	/* Set last: everything before it is configuration, and forwarding it
+	 * would put our own command completes in the capture. */
+	running = true;
+}
+
+/* Legacy scanning: LE Set Scan Parameters and Enable, which report legacy
+ * advertisements only -- the "Legacy only" PHY choice, which this board
+ * refused and the host then could not open a capture with. Called after the
+ * reset, because a controller takes the legacy commands or the extended ones
+ * and not both until it is reset again. */
+static int start_legacy_scan(uint16_t interval, uint16_t window)
+{
+	const uint8_t params[7] = {
+		SCAN_TYPE_PASSIVE,
+		(uint8_t)(interval & 0xFFu), (uint8_t)(interval >> 8),
+		(uint8_t)(window & 0xFFu), (uint8_t)(window >> 8),
+		OWN_ADDR_RANDOM,
+		filter_count > 0u ? FILTER_ACCEPT_LIST : FILTER_ACCEPT_ALL,
+	};
+	int err = send_command(BT_HCI_OP_LE_SET_SCAN_PARAM, params,
+			       sizeof(params));
+
+	if (err != 0) {
+		return err;
+	}
+	/* On, and every repeat kept, as the extended scan does. */
+	const uint8_t enable[2] = {0x01u, 0x00u};
+
+	return send_command(BT_HCI_OP_LE_SET_SCAN_ENABLE, enable,
+			    sizeof(enable));
+}
+
 int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys)
 {
-	if (phys == 0u) {
-		/* Zero would tell the controller to scan on no PHY at all,
-		 * which it accepts and which captures nothing. Refused rather
-		 * than corrected, so a host asking for something impossible
-		 * hears about it. */
-		return -EINVAL;
-	}
 	/* Defaulted and clamped rather than rejected, because the ESP32-C6
 	 * firmware does exactly this and two boards disagreeing about what an
 	 * odd request means would be worse than either answer. A window equal
@@ -628,6 +755,14 @@ int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys)
 	const uint16_t interval = UNITS_PER_MS(interval_ms);
 	const uint16_t window = UNITS_PER_MS(window_ms);
 
+	if (phys == SN_BLE_PHYS_LEGACY) {
+		err = start_legacy_scan(interval, window);
+		if (err == 0) {
+			scan_started();
+		}
+		return err;
+	}
+
 	uint8_t params[3 + 8 * 5];
 	uint8_t n = 0;
 
@@ -659,21 +794,10 @@ int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys)
 
 	err = send_command(BT_HCI_OP_LE_SET_EXT_SCAN_ENABLE,
 			   enable, sizeof(enable));
-	if (err != 0) {
-		return err;
+	if (err == 0) {
+		scan_started();
 	}
-
-	/* A fresh scan is a fresh controller: the reset above dropped any
-	 * syncs it held, so the count has to follow it down or no new train
-	 * would ever be followed. */
-	sync_count = 0u;
-	big_synced = false;
-	k_msgq_purge(&sync_q);
-
-	/* Set last: everything above is configuration, and forwarding it
-	 * would put our own command completes in the capture. */
-	running = true;
-	return 0;
+	return err;
 }
 
 void sn_radio_ble_set_periodic(bool enable)
@@ -688,7 +812,9 @@ static void sync_work_fn(struct k_work *work)
 	struct sync_req req;
 
 	while (k_msgq_get(&sync_q, &req, K_NO_WAIT) == 0) {
-		if (!periodic_enabled || sync_count >= MAX_SYNCS) {
+		/* Not after a STOP: a sync made then would run on, taking
+		 * radio time, into whatever the next capture is. */
+		if (!running || !periodic_enabled || sync_count >= MAX_SYNCS) {
 			continue;
 		}
 
@@ -727,9 +853,12 @@ static void big_work_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
-	if (hci_command(BT_HCI_OP_LE_BIG_CREATE_SYNC, big_params, big_len,
-			NULL) == 0) {
+	/* A STOP may have come between the BIGInfo and this. */
+	if (running && hci_command(BT_HCI_OP_LE_BIG_CREATE_SYNC, big_params,
+				   big_len, NULL) == 0) {
 		big_synced = true;
+	} else {
+		big_retry_at = k_uptime_get() + BIG_RETRY_MS;
 	}
 	atomic_clear(&big_pending);
 }
@@ -744,20 +873,30 @@ static void big_work_fn(struct k_work *work)
  * carried from the sync that preceded it. */
 static void note_biginfo(const uint8_t *hci, uint16_t len)
 {
-	/* H4, event code, length, subevent, then sync_handle and num_bis. */
-	if (len < 8u || hci[1] != 0x3Eu ||
+	/* H4, event code, length, subevent, then sync_handle, num_bis, and
+	 * eighteen bytes on, whether the group is encrypted. */
+	if (len < 23u || hci[1] != 0x3Eu ||
 	    hci[3] != BT_HCI_EVT_LE_BIGINFO_ADV_REPORT) {
 		return;
 	}
-	if (big_synced) {
+	if (big_synced || k_uptime_get() < big_retry_at) {
 		return;
 	}
 
 	const uint16_t sync_handle = hci[4] | ((uint16_t)hci[5] << 8);
-	const uint8_t num_bis = hci[6];
+	uint8_t num_bis = hci[6];
 
-	if (num_bis == 0u || num_bis > MAX_BIS) {
+	/* An encrypted broadcast needs its broadcast code, which nobody has
+	 * given us: asking to join it is refused, and was asked again on
+	 * every event of the train. */
+	if (num_bis == 0u || hci[22] != 0u) {
 		return;
+	}
+	/* As many streams as the controller holds, from the first: a stereo
+	 * broadcast on a one-stream build gives its first channel rather than
+	 * a refusal. */
+	if (num_bis > MAX_BIS) {
+		num_bis = MAX_BIS;
 	}
 
 	/* BIG_Handle, Sync_Handle, Encryption, Broadcast_Code, MSE,
@@ -947,19 +1086,16 @@ int sn_radio_ble_stop(void)
 	ble_flush_locked();
 	k_mutex_unlock(&block);
 
-	const uint8_t disable[6] = {0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u};
-	const int err = send_command(BT_HCI_OP_LE_SET_EXT_SCAN_ENABLE,
-				     disable, sizeof(disable));
-
-	/* And out of the controller. Its resolving list would otherwise keep
-	 * the keys until the next capture's reset, and this board does not
-	 * reset when its port opens. Resolution goes off first: the list
-	 * cannot change while it is on. */
-	const uint8_t off = 0x00u;
-
-	(void)send_command(BT_HCI_OP_LE_SET_ADDR_RES_ENABLE, &off, 1);
-	(void)send_command(BT_HCI_OP_LE_CLEAR_RL, NULL, 0);
-	return err;
+	/* A reset, not only the scan switched off. Periodic and BIG syncs do
+	 * not depend on scanning, so after a STOP they ran on, taking radio
+	 * time from whatever the next capture was -- an 802.15.4 one shares
+	 * the radio -- until a later BLE START reset them. The reset also
+	 * takes the keys out of the controller's resolving list, which would
+	 * otherwise keep them, since this board does not reset when its port
+	 * opens. */
+	sync_count = 0u;
+	big_synced = false;
+	return send_command(BT_HCI_OP_RESET, NULL, 0);
 }
 
 /* Zeroes the counters, when a host opens a session: this board does not
@@ -976,6 +1112,7 @@ void sn_radio_ble_reset_counters(void)
 	periodic_synced = 0u;
 	periodic_reports = 0u;
 	periodic_refused = 0u;
+	command_timeouts = 0u;
 }
 
 void sn_radio_ble_get_stats(struct sn_ble_stats *out)
@@ -987,7 +1124,7 @@ void sn_radio_ble_get_stats(struct sn_ble_stats *out)
 		.oversized = oversized,
 		.queue_full = 0u,
 		.link_rejected = dropped,
-		.command_timeouts = 0u,
+		.command_timeouts = command_timeouts,
 		.periodic_seen = periodic_seen,
 		.periodic_synced = periodic_synced,
 		.periodic_reports = periodic_reports,

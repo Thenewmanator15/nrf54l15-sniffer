@@ -17,6 +17,7 @@
 
 #include "control.h"
 
+#include <zephyr/drivers/regulator.h>
 #include <zephyr/logging/log.h>
 
 #include <errno.h>
@@ -54,6 +55,48 @@ static uint8_t selected_radio = RADIO_154;
 static uint16_t ble_interval_ms;
 static uint16_t ble_window_ms;
 static uint8_t ble_phys = 1u;   /* the 1M PHY, which every advertiser uses */
+
+/* The board's antenna switch: a regulator-fixed node on gpio2.5, active low
+ * and on at boot. On (low) is the onboard ceramic antenna, off (high) the
+ * IPEX connector: Seeed's getting-started guide for this board sets the pin
+ * low for ceramic, its default, and high for external. Measured on a board
+ * with an antenna fitted, switching reads every advertiser about 14.5 dB
+ * apart, so the switch does switch. */
+static const struct device *const rfsw_ctl = DEVICE_DT_GET(DT_NODELABEL(rfsw_ctl));
+
+/* Antenna.INTERNAL is 0 and Antenna.EXTERNAL 1, as the host numbers them.
+ * Through the regulator API rather than the pin, because the regulator
+ * driver owns the pin; is_enabled keeps its reference count at one. */
+static int set_antenna(uint32_t value)
+{
+	if (value > 1u) {
+		return -EINVAL;
+	}
+	if (!device_is_ready(rfsw_ctl)) {
+		return -ENODEV;
+	}
+	const bool onboard = value == 0u;
+
+	if (onboard == regulator_is_enabled(rfsw_ctl)) {
+		return 0;
+	}
+	return onboard ? regulator_enable(rfsw_ctl) : regulator_disable(rfsw_ctl);
+}
+
+/* Stops a radio, 802.15.4 with its open batch sent first, so the host sees
+ * every packet before the reply that says capture has stopped. BLE always
+ * resets the controller, scanning or not: a START that failed part-way has
+ * already loaded keys and a filter. */
+static int stop_radio(uint8_t radio)
+{
+	if (radio == RADIO_BLE) {
+		return sn_radio_ble_stop();
+	}
+	const int err = sn_radio154_stop();
+
+	sn_batch_flush();
+	return err;
+}
 
 static void reply(uint8_t command, uint8_t status, uint32_t value)
 {
@@ -110,15 +153,20 @@ void sn_control_handle(uint8_t type, const uint8_t *payload, size_t len)
 			reply(command, SN_STATUS_BAD_VALUE, value);
 			break;
 		}
+		/* The radio left behind is stopped. It kept running, and its
+		 * frames reached a host decoding them as the other radio's. */
+		if (value != selected_radio) {
+			(void)stop_radio(selected_radio);
+		}
 		selected_radio = (uint8_t)value;
 		reply(command, SN_STATUS_OK, value);
 		break;
 
 	case SN_CMD_SET_BLE_PHYS:
-		/* 1 is the 1M PHY, 4 adds Coded. Zero would ask the controller
-		 * to scan on no PHY, which it accepts and which hears nothing,
-		 * so it is refused here rather than at the radio. */
-		if (value == 0u || value > 0xFFu) {
+		/* 1 is the 1M PHY, 4 adds Coded, 0 is legacy scanning. Zero
+		 * was refused, so the host's "Legacy only" could not open a
+		 * capture on this board at all. */
+		if (value > 0xFFu) {
 			reply(command, SN_STATUS_BAD_VALUE, value);
 			break;
 		}
@@ -153,6 +201,9 @@ void sn_control_handle(uint8_t type, const uint8_t *payload, size_t len)
 			reply(command, SN_STATUS_BAD_VALUE, value);
 			break;
 		}
+		/* The last channel's packets go now, not whenever the linger
+		 * timer next fires. */
+		sn_batch_flush();
 		/* SET_CHANNEL starts the radio, which is what the host
 		 * expects: for 802.15.4 it sends no separate START, and the
 		 * comment in capture.py's _configure says so explicitly.
@@ -196,15 +247,9 @@ void sn_control_handle(uint8_t type, const uint8_t *payload, size_t len)
 		break;
 
 	case SN_CMD_STOP:
-		if (selected_radio == RADIO_BLE) {
-			reply(command,
-			      sn_radio_ble_stop() == 0 ? SN_STATUS_OK
-						       : SN_STATUS_FAILED,
-			      0u);
-			break;
-		}
 		reply(command,
-		      sn_radio154_stop() == 0 ? SN_STATUS_OK : SN_STATUS_FAILED,
+		      stop_radio(selected_radio) == 0 ? SN_STATUS_OK
+						      : SN_STATUS_FAILED,
 		      0u);
 		break;
 
@@ -214,11 +259,23 @@ void sn_control_handle(uint8_t type, const uint8_t *payload, size_t len)
 		 * so without it a second capture carried the first one's counts
 		 * -- 104 frames written up as "509 received" -- and the last
 		 * capture's PHY choice. */
+		/* And from nothing running. A session that ended without a
+		 * STOP -- a killed capture -- left its radio going, and its
+		 * syncs with it, into this one. */
+		(void)stop_radio(RADIO_154);
+		(void)stop_radio(RADIO_BLE);
 		sn_link_reset_counters();
 		sn_batch_reset_counters();
 		sn_radio154_reset_counters();
 		sn_radio_ble_reset_counters();
+		/* Every setting back to its default, not only the PHY:
+		 * periodic following and the scan timing carried over too, and
+		 * a host that sent them only when set could not undo them. */
 		ble_phys = 1u;
+		ble_interval_ms = 0u;
+		ble_window_ms = 0u;
+		sn_radio_ble_set_periodic(false);
+		(void)set_antenna(0u);
 		/* The host refuses to open a capture until this matches
 		 * EXPECTED_FIRMWARE_VERSIONS["nrf54l15"], because an older
 		 * board packs its metadata differently and every field would
@@ -227,20 +284,19 @@ void sn_control_handle(uint8_t type, const uint8_t *payload, size_t len)
 		reply(command, SN_STATUS_OK, sn_firmware_version());
 		break;
 
-	case SN_CMD_SET_ANTENNA:
-		/* This board does have an RF switch, but which position
-		 * selects which antenna is not established -- see
-		 * docs/2026-09-14-nrf54l15-spike.md.
-		 *
-		 * Antenna.INTERNAL == 0 is "leave it as the board brought it
-		 * up", which is exactly what happens here, so it is honest to
-		 * accept it. Asking for the external antenna is refused rather
-		 * than accepted and ignored: a control that silently does
-		 * nothing is worse than one that says it cannot. */
+	case SN_CMD_SET_ANTENNA: {
+		/* It refused the external antenna, which the host offers
+		 * because the board has the switch, so choosing it made the
+		 * capture fail to open. */
+		const int err = set_antenna(value);
+
 		reply(command,
-		      value == 0u ? SN_STATUS_OK : SN_STATUS_BAD_VALUE,
+		      err == 0 ? SN_STATUS_OK
+			       : err == -EINVAL ? SN_STATUS_BAD_VALUE
+						: SN_STATUS_FAILED,
 		      value);
 		break;
+	}
 
 	case SN_CMD_ENERGY_DETECT: {
 		/* Packed as the ESP32-C6 packs it: channel in the low byte,

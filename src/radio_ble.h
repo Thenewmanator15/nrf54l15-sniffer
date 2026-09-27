@@ -54,11 +54,17 @@ struct __attribute__((packed)) sn_ble_meta {
 int sn_radio_ble_init(void);
 
 /* Starts passive scanning. `phys` is a bitmask: 1 is the 1M PHY, 4 adds Coded
- * (long range); 0 is rejected rather than silently treated as 1M. Interval and
- * window are in milliseconds, as the host sends them. */
+ * (long range); 0 is legacy scanning, as on the ESP32-C6. Interval and window
+ * are in milliseconds, as the host sends them. */
 int sn_radio_ble_start(uint16_t interval_ms, uint16_t window_ms, uint8_t phys);
 
+/* Stops the scan and everything it started -- periodic and BIG syncs, the
+ * resolving list -- by resetting the controller. Safe when not scanning. */
 int sn_radio_ble_stop(void);
+
+/* The PHY choice that means legacy scanning: legacy advertisements only,
+ * through the legacy commands. shared/commands.h documents it as 0. */
+#define SN_BLE_PHYS_LEGACY 0u
 
 /* The controller's accept list: N entries of (address type, 6-byte address,
  * least significant byte first) exactly as the host frames them. An empty
@@ -100,19 +106,19 @@ void sn_radio_ble_set_periodic(bool enable);
  * decides from the payload's length how many counters arrived. A field that
  * moves here decodes as the one after it there.
  *
- * Three are always zero on this board, and deliberately: there is no
- * intermediate receive queue to overflow, and send_command does not wait for
- * a controller answer, so neither a queue-full nor a command timeout is a
- * measurement this firmware can make. Reporting anything but zero for them
- * would invent one. */
+ * queue_full is always zero on this board: the firmware has no receive queue
+ * of its own to overflow. (NCS's HCI driver does discard advertising reports
+ * when its raw receive pool is empty, but says nothing when it does, so there
+ * is nothing here to count.) command_timeouts counts commands the controller
+ * never answered within two seconds. */
 struct sn_ble_stats {
 	uint32_t hci_packets;      /* events and ISO packets handed over */
 	uint32_t adv_reports;      /* of those, LE advertising reports */
 	uint32_t forwarded;        /* packets the link accepted */
 	uint32_t oversized;        /* truncated to SN_BLE_MAX_PACKET */
-	uint32_t queue_full;       /* always 0: no such queue here */
+	uint32_t queue_full;       /* always 0: see above */
 	uint32_t link_rejected;    /* packets the outbound ring refused */
-	uint32_t command_timeouts; /* always 0: commands are not awaited */
+	uint32_t command_timeouts; /* commands the controller never answered */
 	uint32_t periodic_seen;    /* advertisers announcing a periodic train */
 	uint32_t periodic_synced;  /* syncs the controller established */
 	uint32_t periodic_reports; /* periodic advertising reports received */

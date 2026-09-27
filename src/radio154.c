@@ -133,6 +133,11 @@ int sn_radio154_start(void)
 
 int sn_radio154_stop(void)
 {
+	/* Safe to call stopped: a new session stops both radios whatever
+	 * the last one left running. */
+	if (!running) {
+		return 0;
+	}
 	const int err = api->stop(radio);
 
 	if (err == 0) {
